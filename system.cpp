@@ -653,15 +653,29 @@ void ValidateIniPath(char szPath[], int nMaxLen)
 		return;
 	}
 
-	strcpy_s(szTemp, sizeof(szTemp)-2, sysdef.szIniFolder);
-	AddTrailingBackslash(szTemp, sizeof(szTemp)-2);
-	strcat_s(szTemp, sizeof(szTemp)-2, szPath);
-
-	if (FileExists(szTemp))
+#ifdef MFC
+	if (szPath[0] != 0)
 	{
-		strcpy_s(szPath, nMaxLen, szTemp);
+		CString strMsg = _T("Unable to locate file ");
+		strMsg += szPath;
+		AfxMessageBox(strMsg);
+	}
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+void BuildFilePath(char* pszSrc, char* pszDst, int nDstSize)
+{
+	*pszDst = 0;
+
+	if (*pszSrc == 0)
+	{
 		return;
 	}
+
+	strcpy_s(pszDst, nDstSize, sysdef.szIniFolder);
+	AddTrailingBackslash(pszDst, nDstSize);
+	strcat_s(pszDst, nDstSize, pszSrc);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -669,27 +683,27 @@ void ProcessConfigEntry(char szLabel[], char* psz)
 {
 	if (strcmp(szLabel, "DRIVE0") == 0)
 	{
-		CopyString(psz, sysdef.szDrivePath[0], sizeof(sysdef.szDrivePath[0])-2);
+		BuildFilePath(psz, sysdef.szDrivePath[0], sizeof(sysdef.szDrivePath[0])-2);
 		ValidateIniPath(sysdef.szDrivePath[0], sizeof(sysdef.szDrivePath[0])-2);
 	}
 	else if (strcmp(szLabel, "DRIVE1") == 0)
 	{
-		CopyString(psz, sysdef.szDrivePath[1], sizeof(sysdef.szDrivePath[1])-2);
+		BuildFilePath(psz, sysdef.szDrivePath[1], sizeof(sysdef.szDrivePath[1])-2);
 		ValidateIniPath(sysdef.szDrivePath[1], sizeof(sysdef.szDrivePath[1])-2);
 	}
 	else if (strcmp(szLabel, "DRIVE2") == 0)
 	{
-		CopyString(psz, sysdef.szDrivePath[2], sizeof(sysdef.szDrivePath[2])-2);
+		BuildFilePath(psz, sysdef.szDrivePath[2], sizeof(sysdef.szDrivePath[2])-2);
 		ValidateIniPath(sysdef.szDrivePath[2], sizeof(sysdef.szDrivePath[2])-2);
 	}
 	else if (strcmp(szLabel, "DRIVE3") == 0)
 	{
-		CopyString(psz, sysdef.szDrivePath[3], sizeof(sysdef.szDrivePath[3])-2);
+		BuildFilePath(psz, sysdef.szDrivePath[3], sizeof(sysdef.szDrivePath[3])-2);
 		ValidateIniPath(sysdef.szDrivePath[3], sizeof(sysdef.szDrivePath[3])-2);
 	}
 	else if (strcmp(szLabel, "ROM") == 0)
 	{
-		CopyString(psz, sysdef.szRomPath, sizeof(sysdef.szRomPath)-2);
+		BuildFilePath(psz, sysdef.szRomPath, sizeof(sysdef.szRomPath)-2);
 		ValidateIniPath(sysdef.szRomPath, sizeof(sysdef.szRomPath)-2);
 	}
 	else if (strcmp(szLabel, "ROMADDR") == 0)
@@ -756,6 +770,8 @@ void LoadIniFile(char* pszFileName)
 	char* psz;
 	int   nLen;
 
+	FileCloseAll();
+
 	memset(&sysdef, 0, sizeof(sysdef));
 
 	strcpy_s(sysdef.szIniFolder, sizeof(sysdef.szIniFolder)-2, pszFileName);
@@ -768,6 +784,11 @@ void LoadIniFile(char* pszFileName)
 	
 	if (f == NULL)
 	{
+#ifdef MFC
+		CString strMsg = _T("Unable to open file ");
+		strMsg += pszFileName;
+		AfxMessageBox(strMsg);
+#endif
 		return;
 	}
 
@@ -795,6 +816,6 @@ void LoadIniFile(char* pszFileName)
 	FileClose(f);
 
 	SetModel(sysdef.nModel);
-  	InitVars();
+	InitVars();
 	InitSystem();
 }
