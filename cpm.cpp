@@ -31,6 +31,63 @@ void CPM_RtcIntr()
 {
 }
 
+//-----------------------------------------------------------------------------
+byte fdc_read_nmi(void)
+{
+	return g_FDC.byNmiStatusReg;
+}
+
+//-----------------------------------------------------------------------------
+// B7 - ENINTRQ (0-disabled disk INTRQ from generating an NMI)
+// B6 - ENDRQ   (0-disables disk DRQ form generating an NMIM)
+void fdc_write_nmi(byte byData)
+{
+#ifdef ENABLE_LOGGING
+	if (g_bLogOpen)
+	{
+	  char szBuf[128];
+	  sprintf_s(szBuf, sizeof(szBuf), "    FDC  WR NMI %02X\r\n", byData);
+	  WriteLogFile(szBuf);
+	}
+#endif
+
+	g_FDC.byNmiMaskReg = byData;
+
+	if (byData & 0x80)
+	{
+		g_FDC.byNmiMaskReg = byData;
+	}
+	else
+	{
+		g_byIntrRequest = 0;
+	}
+}
+
+//----------------------------------------------------------------------------
+void fdc_process_command_request(byte by)
+{
+	if (by == CPM_READ_BLOCK_CMD) // read the CPM 512-byte block indicated by HL, into memtory indicated by DE
+	{
+		if ((g_FDC.byDriveSel < MAX_DRIVES) && (g_dtDives[g_FDC.byDriveSel].f != NULL))
+		{
+			int nOffset = (cpu.regs.wordregs.hl - CPM_PARTITION_BASE) * CPM_BLOCK_SIZE;
+			FileSeek(g_dtDives[g_FDC.byDriveSel].f, nOffset);
+			FileRead(g_dtDives[g_FDC.byDriveSel].f, g_byMemory+cpu.regs.wordregs.de, CPM_BLOCK_SIZE);
+			cpu.regs.byteregs.a = 0;
+		}
+	}
+	else if (by == CPM_WRITE_BLOCK_CMD)
+	{
+		if ((g_FDC.byDriveSel < MAX_DRIVES) && (g_dtDives[g_FDC.byDriveSel].f != NULL))
+		{
+			int nOffset = (cpu.regs.wordregs.hl - CPM_PARTITION_BASE) * CPM_BLOCK_SIZE;
+			FileSeek(g_dtDives[g_FDC.byDriveSel].f, nOffset);
+			FileWrite(g_dtDives[g_FDC.byDriveSel].f, g_byMemory+cpu.regs.wordregs.de, CPM_BLOCK_SIZE);
+			cpu.regs.byteregs.a = 0;
+		}
+	}
+}
+
 void ProcessVideoChar(byte by)
 {
   if (by == 8) // BS
