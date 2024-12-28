@@ -842,6 +842,8 @@ byte Model1_InPort16(byte port, byte addr)
 
 byte Model1_MemRead(word addr)
 {
+	static uint64_t last_keyboard_read = 0xFFFFFFFFFFFFFFFF;
+
 	switch (addr)
 	{
 		case 0x37E0:
@@ -879,6 +881,8 @@ byte Model1_MemRead(word addr)
 		default:
 			if ((addr >= g_wKeyboardStart) && (addr <= g_wKeyboardEnd)) // keyboard
 			{
+				last_keyboard_read = time_us_64();
+
 				if (g_nKeyboardReadCount > 0)
 				{
 					--g_nKeyboardReadCount;
@@ -899,7 +903,14 @@ byte Model1_MemRead(word addr)
 			break;
 	}
 
-  return g_byMemory[addr];
+	if (time_us_64() > (last_keyboard_read + 200000))
+	{
+		last_keyboard_read = 0xFFFFFFFFFFFFFFFF;
+		g_nKeyboardReadCount = 0;
+		ClearKeyboardMemory();
+	}
+
+	return g_byMemory[addr];
 }
 
 void Model1_MemWrite(word addr, byte by)

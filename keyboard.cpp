@@ -17,13 +17,13 @@ byte  g_byKeyboardMode;
 
   A8  = x
   A9  = x
-  A10 = x
+  A10 = 0
   A11 = 1
 
   A12 = 1
   A13 = 1
-  A14
-  A15
+  A14 = 0
+  A15 = 0
 */
 
 typedef struct {
