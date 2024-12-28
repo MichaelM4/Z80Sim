@@ -24,6 +24,13 @@ private:
 	bool   m_bRun;
 	UINT64 m_nLastUpdateTickCount;
 
+	CWinThread* m_pEmuThread;
+	CWinThread* m_pFdcThread;
+
+private:
+	void StartThreads(void);
+	void StopThreads(void);
+
 // Overrides
 public:
 	void RedrawAllWindows(void);
@@ -42,13 +49,14 @@ public:
 
 	afx_msg void OnAppAbout();
 	DECLARE_MESSAGE_MAP()
-	afx_msg void OnSimulateStepinto();
+
 	afx_msg void OnSimulateRestart();
 	afx_msg void OnSimulateGo();
 	virtual BOOL OnIdle(LONG lCount);
 	afx_msg void OnSimulateStop();
 	afx_msg void OnFileEnablelog();
 	virtual CDocument* OpenDocumentFile(LPCTSTR lpszFileName);
+	afx_msg void OnSimulateBreakspoints();
 };
 
 extern CZ80SimApp theApp;

@@ -84,19 +84,24 @@
 #define IDS_FIND_TAB                    302
 #define IDS_EXPLORER                    305
 #define IDS_EDIT_MENU                   306
+#define IDD_BREAK_POINTS                310
+#define IDC_BREAK_POINTS                1000
+#define IDC_ADDRESS                     1001
+#define IDC_ADD                         1002
 #define ID_SIMULATE_STEPINTO            32771
 #define ID_SIMULATE_RESTART             32775
 #define ID_SIMULATE_GO                  32778
 #define ID_SIMULATE_STOP                32780
 #define ID_FILE_ENABLELOG               32781
+#define ID_SIMULATE_BREAKSPOINTS        32782
 
 // Next default values for new objects
 // 
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
-#define _APS_NEXT_RESOURCE_VALUE        310
-#define _APS_NEXT_COMMAND_VALUE         32782
-#define _APS_NEXT_CONTROL_VALUE         1000
+#define _APS_NEXT_RESOURCE_VALUE        312
+#define _APS_NEXT_COMMAND_VALUE         32783
+#define _APS_NEXT_CONTROL_VALUE         1003
 #define _APS_NEXT_SYMED_VALUE           310
 #endif
 #endif

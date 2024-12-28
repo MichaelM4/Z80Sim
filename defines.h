@@ -4,6 +4,8 @@
 
 #include <stdio.h>
 
+#include "types.h"
+
 #define SizeOfArray(x) (sizeof(x) / sizeof(x[0]))
 
 // set to 1 to enable capture of bus activity logging to sd-card
@@ -148,13 +150,11 @@ void ConfigureCoreClock(int nClockOption);
 
 extern uint32_t g_dwForegroundRtc;
 extern uint32_t g_dwBackgroundRtc;
-extern uint16_t  g_wWatchdogRefreshCounter;
+extern uint16_t g_wWatchdogRefreshCounter;
 extern uint32_t g_dwRTC;
 
 extern uint8_t  g_byCaptureBusActivity;
 
-extern uint32_t g_dwRotationTime;
-extern uint32_t g_dwIndexTime;
 extern uint32_t g_dwResetTime;
 
 extern uint8_t  g_byMonitorReset;
@@ -171,12 +171,18 @@ extern uint8_t  sd_byCardInialized;
 void TogglePin(int nCount);
 void InitVars(void);
 void DecodeBusData(FDC_BusType* pHistory, char* psz, int nType);
+void ReleaseWait(void);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 uint32_t CalcDuration(uint32_t dwEndCount, uint32_t dwStartCount);
 void     InitBusTrace(void);
 void     FlushTraceBuffer(void);
+
+#ifndef MFC
+  void strcpy_s(char* pszDst, int nDstSize, char* pszSrc);
+  #define sprintf_s snprintf
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 

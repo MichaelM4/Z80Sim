@@ -16,29 +16,30 @@ extern "C" {
 #define NUM_BLOCKS 32
 #define MAX_TRACK_SIZE (BLOCK_SIZE*NUM_BLOCKS)
 
-                           /* Common status bits:               */
-#define F_BUSY     0x01    /* Controller is executing a command */
-#define F_READONLY 0x40    /* The disk is write-protected       */
-#define F_NOTREADY 0x80    /* The drive is not ready            */
+                            /* Common status bits:               */
+#define F_BUSY      0x01    /* Controller is executing a command */
+#define F_READONLY  0x40    /* The disk is write-protected       */
+#define F_NOTREADY  0x80    /* The drive is not ready            */
 
-                           /* Type-1 command status:            */
-#define F_INDEX    0x02    /* Index mark detected               */
-#define F_TRACK0   0x04    /* Head positioned at track #0       */
-#define F_CRCERR   0x08    /* CRC error in ID field             */
-#define F_SEEKERR  0x10    /* Seek error, track not verified    */
-#define F_HEADLOAD 0x20    /* Head loaded                       */
-#define F_NOTREADY 0x80    /* Drive not ready, drive missing    */
+                            /* Type-1 command status:            */
+#define F_INDEX     0x02    /* Index mark detected               */
+#define F_TRACK0    0x04    /* Head positioned at track #0       */
+#define F_CRCERR    0x08    /* CRC error in ID field             */
+#define F_SEEKERR   0x10    /* Seek error, track not verified    */
+#define F_HEADLOAD  0x20    /* Head loaded                       */
+#define F_PROTECTED 0x40    /* write protected                   */
+#define F_NOTREADY  0x80    /* Drive not ready, drive missing    */
 
-                           /* Type-2 and Type-3 command status: */
-#define F_DRQ      0x02    /* Data request pending              */
-#define F_LOSTDATA 0x04    /* Data has been lost (missed DRQ)   */
-#define F_ERRCODE  0x18    /* Error code bits:                  */
-#define F_BADDATA  0x08    /* 1 = bad data CRC                  */
-#define F_NOTFOUND 0x10    /* 2 = sector not found              */
-#define F_BADID    0x18    /* 3 = bad ID field CRC              */
-#define F_DELETED  0x20    /* Deleted data mark (when reading)  */
-#define F_PROTECT  0x40
-#define F_WRFAULT  0x20    /* Write fault (when writing)        */
+                            /* Type-2 and Type-3 command status: */
+#define F_DRQ       0x02    /* Data request pending              */
+#define F_LOSTDATA  0x04    /* Data has been lost (missed DRQ)   */
+#define F_ERRCODE   0x18    /* Error code bits:                  */
+#define F_BADDATA   0x08    /* 1 = bad data CRC                  */
+#define F_NOTFOUND  0x10    /* 2 = sector not found              */
+#define F_BADID     0x18    /* 3 = bad ID field CRC              */
+#define F_DELETED   0x20    /* Deleted data mark (when reading)  */
+#define F_PROTECT   0x40
+#define F_WRFAULT   0x20    /* Write fault (when writing)        */
 
 /* global HFE defines ========================================================*/
 
@@ -88,19 +89,26 @@ extern "C" {
 #define CPM_WRITE_BLOCK_CMD 0x11
 #define CPM_PARTITION_BASE  0x800
 
+#define FDC_READ_TRACK_SUCCESS 0
+#define FDC_READ_SECTOR_SUCCESS 0
+#define FDC_CRC_ERROR 1
+#define FDC_INVALID_DRIVE 2
+#define FDC_SECTOR_NOT_FOUND 3
+
 /* global variable declarations ==========================================*/
 
 enum {
 	psIdle = 0,
 	psReadSector = 1,
+	psReadTrack,
 	psWriteSector,
 	psWriteTrack,
 	psSeek,
-	psSendData,
 	psMountImage,
 	psOpenFile,
 	psWriteFile,
 	psSetTime,
+	psRestore,
 };
 
 enum {
@@ -113,7 +121,6 @@ enum {
 	eUnknown = 0,
 	eDMK,
 	eHFE,
-	eIMG
 };
 
 typedef struct pictrack_
@@ -159,7 +166,7 @@ enum {
 	eNotReady,
 	eRecordType,
 	eDataRequest,
-	eIntrRequest
+	eHeadLoaded,
 };
 
 typedef struct {
@@ -168,6 +175,7 @@ typedef struct {
 	BYTE byDataLost;
 	BYTE byCrcError;
 	BYTE bySeekError;
+	BYTE byHeadLoaded;
 	BYTE byNotFound;
 	BYTE byProtected;
 	BYTE byNotReady;
@@ -182,14 +190,6 @@ typedef struct {
 							//      0 => data is not available to be read/written;
 							//
 							// when enabled via the corresponding bit of byNmiMaskReg the WAIT output is the inverted state of byDataReq
-	
-	BYTE byIntrRequest;		// controls the INTRQ output pin.  Which simulates an open drain output that when set indicates the completion
-							// of any command and is reset when the computer reads or writes to/from the DR.
-							//
-							// when 1 => command has been completed;
-							//      0 => command can be written or that a command is in progress;
-							//
-							// when enabled via the corresponding bit of byNmiMaskReg the NMI output is the inverted state of byIntrReq
 } FDC_StatusType;
 
 typedef struct {
@@ -238,6 +238,7 @@ typedef struct {
 
 	int nFileOffset;              // byte offset from the start of the file to the start of this track
 
+	int  nDataSize[0x80];         // byte per data entry (1 = single; or 2=double byte data)
 	int  nIDAM[0x80];             // byte offset from start of track buffer for each ID Address Mark
 	int  nDAM[0x80];              // byte offset from start of track buffer for each Data Address Mark
 
@@ -276,6 +277,7 @@ typedef struct {
 	BYTE  byCommandReceived;		// contains the value of the last received command
 	BYTE  byCurCommand;
 	BYTE  byCommandType;			// 1, 2, 3 or 4
+	BYTE  byMultipleRecords;
 
 	short nStepDir;					// 1 = increase track reg on each step; -1 = decrease track reg on each step;
 	
@@ -313,44 +315,61 @@ typedef struct {
 	BYTE  byWaitOutput;		// when 1 => wait line is being held low;
 							//      0 => wait line is released;
 
-	DWORD dwWaitTimeoutCount;
-	DWORD dwRotationCount;
-
-	DWORD dwMotorOnTimer;	// when not zero the drive motor is considered to be ON.
-							// when it reaches zero (after approximately 2 seconds) the motor is considered OFF.
-							// the 2 second count is reloated each time the DRV_SEL latch is written too.
-
 	DWORD dwResetCount;		// increments when the FDC RESET input is low, is set to zero when FDC RESET is high
 							// this can be used to determine if the FDC has received a RESET pulse
 	BYTE  byResetFDC;
 
 	int   nProcessFunction;
 	int   nServiceState;
-	DWORD dwStateCounter;
-
-	int   nReadStatusCount;
+	uint64_t nStateTimer;
 
 	BYTE  bySdCardPresent;
 	
-	int   nDataRegReadCount;
-
 	BYTE  byTransferBuffer[256];
 	int   nTransferSize;
 	int   nTrasferIndex;
+	int   nDataSize;
+
+	BYTE  byDoublerEnable;
+	BYTE  byDoublerSide;
+	BYTE  byDoublerDensity;
+	BYTE  byDoublerPrecomp;
 } FdcType;
+
+#define FDC_REQUEST_SIZE 0x200
+#define FDC_REQUEST_ADDR_START 0x3000
+#define FDC_REQUEST_ADDR_STOP  (FDC_REQUEST_ADDR_START+FDC_REQUEST_SIZE-1)
+
+#define FDC_RESPONSE_SIZE 0x200
+#define FDC_RESPONSE_ADDR_START (FDC_REQUEST_ADDR_START+FDC_REQUEST_SIZE)
+#define FDC_RESPONSE_ADDR_STOP  (FDC_RESPONSE_ADDR_START+FDC_RESPONSE_SIZE-1)
+
+#pragma pack(push)  /* push current alignment to stack */
+#pragma pack(1)     /* set alignment to 1-byte boundary */
+
+	#define FDC_CMD_SIZE 2
+
+	typedef struct {
+		byte cmd[FDC_CMD_SIZE];
+		byte buf[FDC_REQUEST_SIZE-FDC_CMD_SIZE];
+	} BufferType;
+
+#pragma pack(pop)   /* restore original alignment from stack */
 
 /* ==============================================================*/
 
-extern FdcType   g_FDC;
-extern TrackType g_tdTrack;
+extern volatile BYTE g_byIntrRequest;
+extern FdcType       g_FDC;
+extern FdcDriveType  g_dtDives[MAX_DRIVES];
 
 /* function prototypes ==========================================*/
+
+void FdcProcessStatusRequest(byte print);
 
 void LoadHfeTrack(file* pFile, int nTrack, int nSide, HfeDriveType* pdisk, TrackType* ptrack, BYTE* pbyTrackData, int nMaxLen);
 
 void FdcSetFlag(byte flag);
 void FdcClrFlag(byte flag);
-BYTE FdcGetCommandType(BYTE byCommand);
 void FdcGenerateIntr(void);
 void FdcStartCapture(void);
 void FdcInit(void);
@@ -360,12 +379,30 @@ void FdcServiceStateMachine(void);
 void FdcProcessConfigEntry(char szLabel[], char* psz);
 void FdcCloseAllFiles(void);
 
-void fdc_write(uint16_t addr, byte byData);
-byte fdc_read(uint16_t wAddr);
+//void fdc_write_cmd(byte byData);
+//void fdc_write_track(byte byData);
+//void fdc_write_sector(byte byData);
+//void fdc_write_data(byte byData);
+void fdc_write(word addr, byte data);
+
+//byte fdc_read_status(void);
+//byte fdc_read_track(void);
+//byte fdc_read_sector(void);
+//byte fdc_read_data(void);
+byte fdc_read(word addr);
+
 void fdc_write_drive_select(byte byData);
+
 byte fdc_read_nmi(void);
 void fdc_write_nmi(byte byData);
-void fdc_process_command_request(byte by);
+
+#ifdef MFC
+	UINT FdcExecute(LPVOID pParm);
+#else
+	void FdcExecute(void);
+#endif
+
+void StopFdcThread(void);
 
 #ifdef __cplusplus
 }

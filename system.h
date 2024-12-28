@@ -39,8 +39,8 @@ void  StartStopWatch(void);
 void  StopStopWatch(void);
 float GetStopWatchDuration(void);
 
-uint32_t CountDown(uint32_t nCount, uint32_t nAdjust);
-uint32_t CountUp(uint32_t nCount, uint32_t nAdjust);
+uint64_t CountDown(uint64_t nCount, uint64_t nAdjust);
+uint64_t CountUp(uint64_t nCount, uint64_t nAdjust);
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -59,12 +59,9 @@ void  AddTrailingBackslash(char szFilePath[], int nMaxLen);
   void  strcat_s(char* pszDst, int nDstSize, char* pszSrc);
 #endif
 
-#ifdef MFC
-	UINT64 time_us_64(void);
-#endif
+uint64_t time_us_64(void);
 
-void   UpdateCounters(void);
-void   LoadIniFile(char* pszFileName);
+void LoadIniFile(char* pszFileName);
 
 #endif
 

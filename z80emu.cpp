@@ -7,12 +7,14 @@
 #include "string.h"
 #include "keyboard.h"
 
-//#define ENABLE_LOGGING 1
+#define ENABLE_LOGGING 1
 
+byte g_bStopEmu = false;
 byte g_byMemory[BASE_MEMORY_SIZE];
 
-int  g_nRtcCounter;
-int  g_nRtcIntrPeriod;
+uint32_t g_nRtcCounter;
+uint32_t g_nRtcIntrPeriod;
+uint32_t g_nCycleTime; // number of nano seconds per incruction cycle
 
 uint64_t g_nSystemTickCount = 0;
 
@@ -109,6 +111,7 @@ void Z80_ModelInit(void)
       pPortIn16  = Model1_InPort16;
       pRtcIntr   = Model1_RtcIntr;
       g_nRtcIntrPeriod = MODEL1_RTC_INTERRUPT_PERIOD;
+	  g_nCycleTime = 564; // 1.774 MHz
       break;
 
     case eModel3:
@@ -120,6 +123,7 @@ void Z80_ModelInit(void)
       pPortIn16  = Model3_InPort16;
       pRtcIntr   = Model3_RtcIntr;
       g_nRtcIntrPeriod = MODEL3_RTC_INTERRUPT_PERIOD;
+	  g_nCycleTime = 564;
       break;
 
     case eModel4:
@@ -131,6 +135,7 @@ void Z80_ModelInit(void)
       pPortIn16  = Model4_InPort16;
       pRtcIntr   = Model4_RtcIntr;
       g_nRtcIntrPeriod = MODEL3_RTC_INTERRUPT_PERIOD;
+	  g_nCycleTime = 564;
       break;
 
     case eCpm:
@@ -141,7 +146,8 @@ void Z80_ModelInit(void)
       pPortIn    = CPM_InPort;
       pPortIn16  = CPM_InPort16;
       pRtcIntr   = CPM_RtcIntr;
-      g_nRtcIntrPeriod = MODEL3_RTC_INTERRUPT_PERIOD;
+      g_nRtcIntrPeriod = MODEL_CPM_RTC_INTERRUPT_PERIOD;
+	  g_nCycleTime = 564;
       break;
   }
 
@@ -155,23 +161,21 @@ void SetModel(int nModel)
 
 void InitSystem(void)
 {
-  ResetCpu();
+	ResetCpu();
 
-  memset(g_byMemory, 0xFF, sizeof(g_byMemory));
+	memset(g_byMemory, 0xFF, sizeof(g_byMemory));
 
-  g_nRtcCounter = 0;
-  g_nSystemTickCount = 0;
-  InitKeyboard();
-  Z80_ModelInit();
+	g_nRtcCounter = 0;
+	g_nSystemTickCount = 0;
+	InitKeyboard();
+	Z80_ModelInit();
 	FdcInit();
 }
 
-#ifdef MFC
-UINT64 time_us_64(void)
+uint64_t time_us_64(void)
 {
   return g_nSystemTickCount;
 }
-#endif
 
 void ResetCpu(void)
 {
@@ -8430,19 +8434,142 @@ InstType inst[] = {
 };
 
 #ifdef ENABLE_LOGGING
-/////////////////////////////////////////////////
-void LogNextInstruction(word pc)
+static void GetFlagsStr(byte f, char szBuf[])
 {
-  char szBuf[128];
-  char szInst[64];
+	if (f & S_FLAG_MASK)
+	{
+		szBuf[0] = 'S';
+	}
+	else
+	{
+		szBuf[0] = 's';
+	}
+
+	if (f & Z_FLAG_MASK)
+	{
+		szBuf[1] = 'Z';
+	}
+	else
+	{
+		szBuf[1] = 'z';
+	}
+
+	if (f & X_FLAG_MASK)
+	{
+		szBuf[2] = 'X';
+	}
+	else
+	{
+		szBuf[2] = 'x';
+	}
+
+	if (f & H_FLAG_MASK)
+	{
+		szBuf[3] = 'H';
+	}
+	else
+	{
+		szBuf[3] = 'h';
+	}
+
+	if (f & X_FLAG_MASK)
+	{
+		szBuf[4] = 'X';
+	}
+	else
+	{
+		szBuf[4] = 'x';
+	}
+
+	if (f & P_FLAG_MASK)
+	{
+		szBuf[5] = 'P';
+	}
+	else
+	{
+		szBuf[5] = 'p';
+	}
+
+	if (f & N_FLAG_MASK)
+	{
+		szBuf[6] = 'n';
+	}
+	else
+	{
+		szBuf[6] = 'N';
+	}
+
+	if (f & C_FLAG_MASK)
+	{
+		szBuf[7] = 'C';
+	}
+	else
+	{
+		szBuf[7] = 'c';
+	}
+
+	szBuf[8] = 0;
+}
+
+/////////////////////////////////////////////////
+void LogInstruction(word pc)
+{
+	static word bc = 0;
+	static word de = 0;
+	static word hl = 0;
+	static byte a = 0;
+	static byte f = 0;
+
+	char szBuf[256];
+	char szInst[64];
+	char szFlags[64];
+
 	GetInstructionName(pc, szInst, sizeof(szInst)-2);
+	sprintf_s(szBuf, sizeof(szBuf), "%04X %-14s", pc, szInst);
+	
+	if (a != cpu.regs.byteregs.a)
+	{
+		sprintf_s(szInst, sizeof(szInst)-1, " A=%02X (%02X)", cpu.regs.byteregs.a, a);
+		strcat_s(szBuf, sizeof(szBuf)-1, szInst);
+		a = cpu.regs.byteregs.a;
+	}
 
-  sprintf_s(szBuf, sizeof(szBuf), "%04X ", pc);
-  strcat_s(szBuf, sizeof(szBuf), szInst);
+	if (bc != cpu.regs.wordregs.bc)
+	{
+		sprintf_s(szInst, sizeof(szInst)-1, " BC=%04X (%04X)", cpu.regs.wordregs.bc, bc);
+		strcat_s(szBuf, sizeof(szBuf)-1, szInst);
+		bc = cpu.regs.wordregs.bc;
+	}
 
-//  sprintf_s(szInst, sizeof(szInst)-2, "%02X %02X %02X %02X\r\n", GetMem(pc), GetMem(pc+1), GetMem(pc+2), GetMem(pc+3));
-  strcat_s(szBuf, sizeof(szBuf), (char*)"\r\n"); //szInst);
-  WriteLogFile(szBuf);
+	if (de != cpu.regs.wordregs.de)
+	{
+		sprintf_s(szInst, sizeof(szInst)-1, " DE=%04X (%04X)", cpu.regs.wordregs.de, de);
+		strcat_s(szBuf, sizeof(szBuf)-1, szInst);
+		de = cpu.regs.wordregs.de;
+	}
+
+	if (hl != cpu.regs.wordregs.hl)
+	{
+		sprintf_s(szInst, sizeof(szInst)-1, " HL=%04X (%04X)", cpu.regs.wordregs.hl, hl);
+		strcat_s(szBuf, sizeof(szBuf)-1, szInst);
+		hl = cpu.regs.wordregs.hl;
+	}
+
+	if (f != cpu.regs.byteregs.f)
+	{
+		GetFlagsStr(cpu.regs.byteregs.f, szFlags);
+		strcat_s(szBuf, sizeof(szBuf)-1, " F=");
+		strcat_s(szBuf, sizeof(szBuf)-1, szFlags);
+
+		strcat_s(szBuf, sizeof(szBuf)-1, " (");
+		GetFlagsStr(f, szFlags);
+		strcat_s(szBuf, sizeof(szBuf)-1, szFlags);
+		strcat_s(szBuf, sizeof(szBuf)-1, ")");
+		f = cpu.regs.byteregs.f;
+	}
+
+	strcat_s(szBuf, sizeof(szBuf)-1, "\r\n");
+	WriteLogFile(szBuf);
 }
 #endif
 
@@ -8524,67 +8651,82 @@ void EmuProcessNmi(void)
     cpu.cycles += 11;
 }
 
-void EmuExecute(byte bySingleStep)
-{
-  byte by;
-
-  if (bySingleStep)
-  {
-    by = GetMem(cpu.pc);
-
-    if (cpu.intr && cpu.iff1) // interrupt enabled and one is requested
-    {
-      EmuProcessIntr(by);
-    }
-    else if (cpu.nmi)
-    {
-      EmuProcessNmi();
-    }
-    else
-    {
-      EmuExecInst(by);
-    }
-  }
-  else
-  {
-    while (cpu.cycles < EXEC_LOOP_COUNT)
-    {
-#ifdef ENABLE_LOGGING
-		  if (g_bLogOpen)
-		  {
-        LogNextInstruction(cpu.pc);
-      }
+#ifdef MFC
+UINT EmuExecute(LPVOID pParm)
+#else
+void EmuExecute(void)
 #endif
+{
+	byte     by;
+	word     pc;
+	uint32_t us;
+	uint32_t exec_ns = 0;
+	int      nDelay, bp = 0;
 
-      by = GetMem(cpu.pc);
+	//uint64_t nCurrentTickCount = GetTickCount64();
+	//uint64_t nTicks, nPrevTickCount, nDelay;
 
-      if (cpu.intr && cpu.iff1) // interrupt enabled and one is requested
-      {
-        EmuProcessIntr(by);
-      }
-      else if (cpu.nmi)
-      {
-        EmuProcessNmi();
-      }
-      else
-      {
-        EmuExecInst(by);
-      }
-    }
-  }
+	//nPrevTickCount = nCurrentTickCount;
 
-  if (cpu.cycles >= EXEC_LOOP_COUNT)
-  {
-    g_nSystemTickCount += EXEC_LOOP_TIME;
-    cpu.nTotalCycles += EXEC_LOOP_TIME;
-    cpu.cycles -= EXEC_LOOP_COUNT;
+	g_bStopEmu = false;
 
-    g_nRtcCounter += EXEC_LOOP_COUNT;
+	while (!g_bStopEmu)
+	{
+		pc = cpu.pc;
 
-    if (g_nRtcIntrPeriod <= g_nRtcCounter)
-    {
-      g_nRtcCounter -= g_nRtcIntrPeriod;
-      (*pRtcIntr)();
-    }
-  }
+		by = GetMem(cpu.pc);
+
+		if (cpu.intr && cpu.iff1) // interrupt enabled and one is requested
+		{
+			EmuProcessIntr(by);
+		}
+		else if (cpu.nmi)
+		{
+			EmuProcessNmi();
+		}
+		else
+		{
+			EmuExecInst(by);
+		}
+
+		cpu.nTotalCycles += cpu.cycles;
+
+		exec_ns += (cpu.cycles * g_nCycleTime); // nano seconds for instruction to execute
+		us = (exec_ns / 1000);					// whole micro seconds
+		exec_ns = exec_ns % 1000;
+
+		g_nSystemTickCount += us;
+		g_nRtcCounter += us;
+
+		if (g_nRtcIntrPeriod <= g_nRtcCounter)
+		{
+			g_nRtcCounter -= g_nRtcIntrPeriod;
+			(*pRtcIntr)();
+		}
+
+		//nCurrentTickCount = GetTickCount64();
+		//nTicks = (nCurrentTickCount - nPrevTickCount);
+		//nPrevTickCount = nCurrentTickCount;
+
+		nDelay = cpu.cycles * 100;
+		for (int i = 0; i < nDelay; ++i);
+
+		cpu.cycles = 0;
+
+#ifdef ENABLE_LOGGING
+		if (g_bLogOpen)
+		{
+			LogInstruction(pc);
+		}
+#endif
+	}
+
+#ifdef MFC
+	return TRUE;
+#endif
+}
+
+void StopEmuThread(void)
+{
+	g_bStopEmu = true;
 }

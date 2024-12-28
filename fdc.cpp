@@ -5,22 +5,39 @@
 #include <ctype.h>
 #include <stdlib.h>
 
+#ifndef MFC
+	#include "hardware/gpio.h"
+	#include "pico/stdlib.h"
+	#include "sd_core.h"
+#endif
+
 #include "defines.h"
-#include "datetime.h"
 #include "file.h"
 #include "system.h"
 #include "crc.h"
 #include "fdc.h"
-#include "z80emu.h"
 
-extern CpuType cpu;
-extern int g_nModel;
-extern byte g_byMemory[0x10000];
+#define ENABLE_LOGGING 1
+// #pragma GCC optimize ("Og")
+
+#ifdef MFC
+	#include "z80emu.h"
+
+	extern CpuType cpu;
+	extern int     g_nModel;
+	extern byte    g_byMemory[0x10000];
+
+	#define __not_in_flash_func(x) x
+#endif
+
+extern bool g_bLogOpen;
 
 ////////////////////////////////////////////////////////////////////////////////////
 /*
 
 For JV1 and JV3 format information see https://www.tim-mann.org/trs80/dskspec.html
+
+For DMK format see http://cpmarchives.classiccmp.org/trs80/mirrors/www.discover-net.net/~dmkeil/coco/cocotech.htm#Technical-DMK-disks
 
 */
 ////////////////////////////////////////////////////////////////////////////////////
@@ -60,6 +77,12 @@ Track Data:
 	Modification should not be done as each IDAM and sector has a CRC, this is just like a real
 	disk, and modifying the sector data without updating the CRC value will cause CRC errors when
 	accessing the virtual disk within the emulator.  
+
+	The actual track data follows the header and can be viewed with a hex editor showing the raw
+	data on the track. If the virtual disk doesn't have bits 6 or 7 set of byte 4 of the disk header
+	then each single density data byte is written twice, this includes IDAMs and CRCs (the CRCs are
+	calculated as if only 1 byte was written however). The IDAM and sector data each have CRCs, this
+	is just like on a real disk.
 
 Track header:
 
@@ -130,7 +153,7 @@ IDAM/Sector header:
 		bySectorData[SectorOffset-1] should be 0xA1
 		bySectorData[SectorOffset]   should be 0xFE
 		bySectorData[SectorOffset+1] is track address (should be the same as the nTrack parameter)
-		bySectorData[SectorOffset+2] side number			(should be the same as the nSide parameter)
+		bySectorData[SectorOffset+2] side number      (should be the same as the nSide parameter)
 		bySectorData[SectorOffset+3] sector number    (should be the same as the nSector parameter)
 		bySectorData[SectorOffset+4] byte length (log 2, minus seven), 0 => 128 bytes; 1 => 256 bytes; etc.
 
@@ -138,35 +161,102 @@ IDAM/Sector header:
 
 		bySectorData[SectorOffset]   should be 0xFE
 		bySectorData[SectorOffset+1] is track address (should be the same as the nTrack parameter)
-		bySectorData[SectorOffset+2] side number			(should be the same as the nSide parameter)
+		bySectorData[SectorOffset+2] side number      (should be the same as the nSide parameter)
 		bySectorData[SectorOffset+3] sector number    (should be the same as the nSector parameter)
 		bySectorData[SectorOffset+4] byte length (log 2, minus seven), 0 => 128 bytes; 1 => 256 bytes; etc.
 
 DAM marker values:
 
-						Single Density			Double Density
+			Single Density		Double Density
 	--------------------------------------------
-	0xFB			Normal data					Normal data
-	0xFA			User-defined				Invalid
-	0xF9			User-defines				Invalid
-	0xF8			Deleted data				Deleted data
+	0xFB	Normal data			Normal data
+	0xFA	User-defined		Invalid
+	0xF9	User-defines		Invalid
+	0xF8	Deleted data		Deleted data
 
+*/
+
+/*
+	RS Double Density Adapter
+
+	Function selection is perfomed via writes to the sector register (0x37EE)
+
+	Value		Function
+	--------------------------------
+    40-5F       Select side 0 (is not routed to drive, thus has no effect)
+    60-7F       Select side 1
+    80-9F       Set double-density mode
+    A0-BF       Set single-density mode
+    C0-DF       Disable precomp
+    E0-FF       Enable precomp
 */
 
 ////////////////////////////////////////////////////////////////////////////////////
 
-FdcType       g_FDC;
-FdcDriveType  g_dtDives[MAX_DRIVES];
-TrackType     g_tdTrack;
-SectorType    g_stSector;
+FdcType      g_FDC;
+FdcDriveType g_dtDives[MAX_DRIVES];
 
-uint64_t g_nMaxSeekTime;
-uint32_t g_dwPrevTraceCycleCount = 0;
-char     g_szBootConfig[80];
-BYTE     g_byBootConfigModified;
+static char* g_pszVersion = {(char*)"0.1.1"};
+
+static TrackType     g_tdTrack;
+static SectorType    g_stSector;
+
+static char          g_szBootConfig[80];
+
+static BufferType    g_bFdcRequest;
+static BufferType    g_bFdcResponse;
+
+#ifndef MFC
+	static DIR           g_dj;				// Directory object
+	static FILINFO       g_fno;				// File information
+
+	static char          g_szFindFilter[80];
+
+	#define FIND_MAX_SIZE 100
+
+	static FILINFO g_fiFindResults[FIND_MAX_SIZE];
+	static int     g_nFindIndex;
+	static int     g_nFindCount;
+#endif
+
+static BYTE    g_byTrackBuffer[MAX_TRACK_SIZE];
+
+static uint8_t  g_byMotorWasOn;
+static uint64_t g_nTimeNow;
+static uint64_t g_nPrevTime;
+static uint32_t g_dwRotationTime;
+static uint32_t g_dwIndexTime;
+static uint8_t  g_byTrackWritePerformed;
+static uint8_t  g_byRwIndex;
+static char     g_szRwBuf[256];
+
+static byte     byCommandTypes[] = {1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 4, 3, 3};
 
 //-----------------------------------------------------------------------------
-int FdcGetDriveIndex(int nDriveSel)
+
+volatile BYTE	  g_byIntrRequest;		// controls the INTRQ output pin.  Which simulates an open drain output that when set indicates the completion
+										// of any command and is reset when the computer reads or writes to/from the DR.
+										//
+										// when 1 => command has been completed;
+										//      0 => command can be written or that a command is in progress;
+										//
+										// when enabled via the corresponding bit of byNmiMaskReg the NMI output is the inverted state of byIntrReq
+
+#ifdef MFC
+	volatile int64_t  g_nRotationCount;
+	volatile uint64_t g_nMotorOnTimer;
+	volatile byte     g_byFdcIntrActive;
+	volatile byte     g_byEnableIntr;
+	volatile byte     g_bStopFdc;
+#else
+	volatile int32_t  g_nRotationCount;
+	volatile uint32_t g_nMotorOnTimer;
+#endif
+
+volatile uint8_t g_byBootConfigModified;
+
+//-----------------------------------------------------------------------------
+int __not_in_flash_func(FdcGetDriveIndex)(int nDriveSel)
 {
 	if (nDriveSel & 0x01)
 	{
@@ -180,112 +270,21 @@ int FdcGetDriveIndex(int nDriveSel)
 	{
 		return 2;
 	}
-	else if (nDriveSel & 0x08)
-	{
-		return 3;
-	}
 	
 	return -1;
 }
 
 //-----------------------------------------------------------------------------
-int FdcGetSide(byte byDriveSel)
+int __not_in_flash_func(FdcGetSide)(byte byDriveSel)
 {
-	switch (g_nModel)
+	if (byDriveSel & 0x08) // Model I side select
 	{
-		case eModel1:
-			if (byDriveSel & 0x08) // Model I side select
-			{
-				return 1;
-			}
-			else
-			{
-				return 0;
-			}
-
-			break;
-
-		case eModel3:
-		case eModel4:
-			if (byDriveSel & 0x10) // Model III/IV side select
-			{
-				return 1;
-			}
-			else
-			{
-				return 0;
-			}
-
-			break;
-
-		default:
-			return 0;
+		return 1;
 	}
-}
-
-//----------------------------------------------------------------------------
-BYTE FdcGetCommandType(BYTE byCommand)
-{
-	BYTE byType = 0;
-	
-	if (g_FDC.byDriveSel == 0x0F)
+	else
 	{
-		return 2;
+		return 0;
 	}
-
-	switch (byCommand >> 4)
-	{
-		case 0: // Restore
-			byType = 1;
-			break;
-
-		case 1: // Seek
-			byType = 1;
-			break;
-
-		case 2: // Step (don't update track register)
-		case 3: // Step (update track register)
-			byType = 1;
-			break;
-
-		case 4: // Step In (don't update track register)
-		case 5: // Step In (update track register)
-			byType = 1;
-			break;
-
-		case 6: // Step Out (don't update track register)
-		case 7: // Step Out (update track register)
-			byType = 1;
-			break;
-
-		case 8: // Read Sector (single record)
-		case 9: // Read Sector (multiple record)
-			byType = 2;
-			break;
-
-		case 10: // Write Sector (single record)
-		case 11: // Write Sector (multiple record)
-			byType = 2;
-			break;
-
-		case 12: // Read Address
-			byType = 3;
-			break;
-
-		case 13: // Force Interrupt
-			byType = 4;
-			break;
-
-		case 14: // Read Track
-			byType = 3;
-			break;
-
-		case 15: // Write Track
-			byType = 3;
-			break;
-	}	
-	
-	return byType;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -311,9 +310,10 @@ BYTE FdcGetCommandType(BYTE byCommand)
 //       1 = DR is full on read operation or empty on write operation
 //  S0 - 1 = busy, command in progress
 //
-void FdcUpdateStatus(void)
+void __not_in_flash_func(FdcUpdateStatus)(void)
 {
 	BYTE byStatus = 0;
+	BYTE byCmd;
 	int  nDrive;
 
 	nDrive = FdcGetDriveIndex(g_FDC.byDriveSel);
@@ -323,7 +323,7 @@ void FdcUpdateStatus(void)
 		byStatus = F_NOTREADY | F_HEADLOAD;
 	}
 	else if ((g_FDC.byCommandType == 1) || // Restore, Seek, Step, Step In, Step Out
-           (g_FDC.byCommandType == 4))   // Force Interrupt
+             (g_FDC.byCommandType == 4))   // Force Interrupt
 	{
 		byStatus = 0;
 		
@@ -357,7 +357,10 @@ void FdcUpdateStatus(void)
 			byStatus |= F_SEEKERR;
 		}
 		
-		byStatus |= F_HEADLOAD;
+		if (g_FDC.status.byHeadLoaded)
+		{
+			byStatus |= F_HEADLOAD;
+		}
 
 		// S6 (PROTECTED) default to 0
 		if (g_FDC.status.byProtected || (g_dtDives[nDrive].nDriveFormat == eHFE))
@@ -372,7 +375,7 @@ void FdcUpdateStatus(void)
 		}
 	}
 	else if ((g_FDC.byCommandType == 2) ||	// Read Sector, Write Sector
-			     (g_FDC.byCommandType == 3))	  // Read Address, Read Track, Write Track
+			 (g_FDC.byCommandType == 3))	// Read Address, Read Track, Write Track
 	{
 		byStatus = 0;
 		
@@ -397,7 +400,7 @@ void FdcUpdateStatus(void)
 		// S3 (CRC ERROR)        default to 0
 		if (g_FDC.status.byCrcError)
 		{
-			byStatus |= F_BADDATA;
+			byStatus |= F_CRCERR;
 		}
 		
 		// S4 (RECORD NOT FOUND) default to 0
@@ -406,29 +409,65 @@ void FdcUpdateStatus(void)
 			byStatus |= F_NOTFOUND;
 		}
 	
-		// S5 (RECORD TYPE) default to 0
-		// S6 (PROTECTED) default to 0
-		switch (g_FDC.status.byRecordType)
+		byCmd = g_FDC.byCurCommand >> 4;
+
+		// S5 and S6 based on latest command, not just command type
+		if ((byCmd == 8) || (byCmd == 9)) // read sector (8=single; 9=multiple)
 		{
-			case 0xFB:
-				byStatus &= ~F_DELETED;
-				byStatus &= ~F_PROTECT;
-				break;
+			switch (g_FDC.status.byRecordType)
+			{
+				case 0xFB: // Data Mark
+					// S5 = 0
+					// S6 = 0
+					break;
 
-			case 0xFA:
-				byStatus |= F_DELETED;
-				byStatus &= ~F_PROTECT;
-				break;
+				case 0xFA: // user defined
+					// S5 = 0
+					// S6 = 1
+					byStatus |= 0x20;
+					break;
 
-			case 0xF9:
-				byStatus &= ~F_DELETED;
-				byStatus |= F_PROTECT;
-				break;
+				case 0xF9: // user defined
+					// S5 = 1
+					byStatus |= 0x20;
+					// S6 = 0
+					break;
 
-			case 0xF8:
-				byStatus |= F_DELETED;
-				byStatus |= F_PROTECT;
-				break;
+				case 0xF8: // Deleted Data Mark
+					// S5 = 1
+					byStatus |= 0x20;
+					// S6 = 1
+					byStatus |= 0x40;
+					break;
+			}
+		}
+		else if (g_FDC.byCurCommand == 0xC4) // read address
+		{
+			// S5 = 0
+			// S6 = 0
+		}
+		else if ((g_FDC.byCurCommand == 0xE4) || (g_FDC.byCurCommand == 0xE6)) // read track
+		{
+			// S5 = 0
+			// S6 = 0
+		}
+		else if ((byCmd == 10) || (byCmd == 11)) // write sector  (8=single; 9=multiple)
+		{
+			// S5 = WRITE FAULT
+			// S6 (PROTECTED) default to 0
+			if (g_FDC.status.byProtected || (g_dtDives[nDrive].nDriveFormat == eHFE))
+			{
+				byStatus |= 0x40;
+			}
+		}
+		else if (byCmd == 0xF4) // write track
+		{
+			// S5 = WRITE FAULT
+			// S6 (PROTECTED) default to 0
+			if (g_FDC.status.byProtected || (g_dtDives[nDrive].nDriveFormat == eHFE))
+			{
+				byStatus |= 0x40;
+			}
 		}
 
 		// S7 (NOT READY) default to 0
@@ -445,7 +484,8 @@ void FdcUpdateStatus(void)
 	g_FDC.byStatus = byStatus;
 }
 
-void FdcSetFlag(byte flag)
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(FdcSetFlag)(byte flag)
 {
 	switch (flag)
 	{
@@ -481,24 +521,20 @@ void FdcSetFlag(byte flag)
 			g_FDC.status.byNotReady = 1;
 			break;
 
-		case eRecordType:
-			g_FDC.status.byRecordType = 1;
-			break;
-
 		case eDataRequest:
 			g_FDC.status.byDataRequest = 1;
 			break;
 
-		case eIntrRequest:
-			g_FDC.status.byIntrRequest = 1;
+		case eHeadLoaded:
+			g_FDC.status.byHeadLoaded = 1;
 			break;
-
 	}
 
 	FdcUpdateStatus();
 }
 
-void FdcClrFlag(byte flag)
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(FdcClrFlag)(byte flag)
 {
 	switch (flag)
 	{
@@ -534,23 +570,19 @@ void FdcClrFlag(byte flag)
 			g_FDC.status.byNotReady = 0;
 			break;
 
-		case eRecordType:
-			g_FDC.status.byRecordType = 0;
-			break;
-
 		case eDataRequest:
 			g_FDC.status.byDataRequest = 0;
 			break;
 
-		case eIntrRequest:
-			g_FDC.status.byIntrRequest = 0;
+		case eHeadLoaded:
+			g_FDC.status.byHeadLoaded = 0;
 			break;
-
 	}
 
 	FdcUpdateStatus();
 }
 
+//-----------------------------------------------------------------------------
 void FdcSetRecordType(byte byType)
 {
 	g_FDC.status.byRecordType = byType;
@@ -573,11 +605,10 @@ int FdcGetTrackOffset(int nDrive, int nSide, int nTrack)
 // returns the index of the 0xFE byte in the sector byte sequence 0xA1, 0xA1, 0xA1, 0xFE
 // in the g_tdTrack.byTrackData[] address
 //
-int FdcGetIDAM_Index(int nSector)
+WORD FdcGetIDAM(int nSector)
 {
 	BYTE* pby;
 	WORD  wIDAM;
-	int   nSectorOffset;
 
 	// get IDAM pointer for the specified track
 	pby = g_tdTrack.byTrackData + nSector * 2;
@@ -585,14 +616,11 @@ int FdcGetIDAM_Index(int nSector)
 	// get IDAM value for the specified track
 	wIDAM = (*(pby+1) << 8) + *pby;
 
-	// get offset from start of track to specified sector
-	nSectorOffset = (wIDAM & 0x3FFF);
-
-	return nSectorOffset;
+	return wIDAM;
 }
 
 //-----------------------------------------------------------------------------
-// determines the index of the Data Address Mark for the specified locical sector.
+// determines the index of the Data Address Mark for the specified logical sector.
 //
 // returns the index of the 0xFE byte in the sector byte sequence 0xA1, 0xA1, 0xA1, 0xFE
 // in the g_tdTrack.byTrackData[] address for the specified sector.
@@ -600,11 +628,13 @@ int FdcGetIDAM_Index(int nSector)
 int FdcGetSectorIDAM_Offset(int nSide, int nTrack, int nSector)
 {
 	BYTE* pby;
+	WORD  wIDAM;
 	int   i, nOffset;
 
 	for (i = 0; i < 0x80; ++i)
 	{
-		nOffset = FdcGetIDAM_Index(i);
+		wIDAM   = FdcGetIDAM(i);
+		nOffset = wIDAM & 0x3FFF;
 
 		// bySectorData[nOffset-3] should be 0xA1
 		// bySectorData[nOffset-2] should be 0xA1
@@ -617,9 +647,26 @@ int FdcGetSectorIDAM_Offset(int nSide, int nTrack, int nSector)
 
 		pby = g_tdTrack.byTrackData + nOffset;
 
-		if ((*(pby+1) == nTrack) && (*(pby+2) == nSide) && (*(pby+3) == nSector))
+		if ((*pby == 0xFE) && (*(pby+1) == 0xFE)) // then double byte data
 		{
-			return nOffset;
+			if ((*(pby+2) == nTrack) && (*(pby+4) == nSide) && (*(pby+6) == nSector))
+			{
+				return nOffset;
+			}
+		}
+		else if (wIDAM & 0x8000)
+		{
+			if ((*(pby+1) == nTrack) && (*(pby+2) == nSide) && (*(pby+3) == nSector))
+			{
+				return nOffset;
+			}
+		}
+		else
+		{
+			if ((*(pby+1) == nTrack) && (*(pby+2) == nSide) && (*(pby+3) == nSector))
+			{
+				return nOffset;
+			}
 		}
 	}
 
@@ -664,17 +711,38 @@ BYTE FdcIsDataStartPatern(BYTE* pby)
 }
 
 //-----------------------------------------------------------------------------
-int FdcGetDAM_Offset(TrackType* ptdTrack, int nIDAM)
+int FdcGetDataSize(TrackType* ptdTrack, int nIDAM)
 {
 	BYTE* pby;
-	int   nDataOffset = FdcGetIDAM_Offset(nIDAM) + 7;
+	int   nDataOffset = FdcGetIDAM_Offset(nIDAM);
+	
+	if (nIDAM < 0)
+	{
+		return 1;
+	}
+
+	pby = ptdTrack->byTrackData+nDataOffset;
+
+	if ((*pby == 0xFE) && (*(pby+1) == 0xFE))
+	{
+		return 2;
+	}
+
+	return 1;
+}
+
+//-----------------------------------------------------------------------------
+int FdcGetDAM_Offset(TrackType* ptdTrack, int nIDAM, int nDataSize)
+{
+	BYTE* pby;
+	int   nDataOffset = FdcGetIDAM_Offset(nIDAM) + 7 * nDataSize;
 	
 	if (nIDAM < 0)
 	{
 		return -1;
 	}
 
-	if (ptdTrack->byDensity == eDD) // double density
+	if ((nDataSize == 1) && (ptdTrack->byDensity == eDD)) // double density
 	{
 		// locate the byte sequence 0xA1, 0xA1, 0xA1, 0xFB/0xF8
 		while (nDataOffset < ptdTrack->nTrackSize)
@@ -701,7 +769,7 @@ int FdcGetDAM_Offset(TrackType* ptdTrack, int nIDAM)
 			}
 			else
 			{
-				++nDataOffset;
+				nDataOffset += nDataSize;
 			}
 		}
 	}
@@ -716,8 +784,9 @@ void FdcFillSectorOffset(TrackType* ptdTrack)
 	
 	for (i = 0; i < 0x80; ++i)
 	{
-		ptdTrack->nIDAM[i] = FdcGetSectorIDAM_Offset(ptdTrack->nSide, ptdTrack->nTrack, i);
-		ptdTrack->nDAM[i]  = FdcGetDAM_Offset(ptdTrack, ptdTrack->nIDAM[i]);
+		ptdTrack->nIDAM[i]     = FdcGetSectorIDAM_Offset(ptdTrack->nSide, ptdTrack->nTrack, i);
+		ptdTrack->nDataSize[i] = FdcGetDataSize(ptdTrack, ptdTrack->nIDAM[i]);
+		ptdTrack->nDAM[i]      = FdcGetDAM_Offset(ptdTrack, ptdTrack->nIDAM[i], ptdTrack->nDataSize[i]);
 	}
 }
 
@@ -751,6 +820,36 @@ void FdcReadDmkTrack(int nDrive, int nSide, int nTrack)
 	g_tdTrack.nTrackSize = g_dtDives[nDrive].dmk.wTrackLength;
 
 	FdcFillSectorOffset(&g_tdTrack);
+
+	// For Double denisty
+	// 	bySectorData[SectorOffset-3] should be 0xA1
+	// 	bySectorData[SectorOffset-2] should be 0xA1
+	// 	bySectorData[SectorOffset-1] should be 0xA1
+	// 	bySectorData[SectorOffset]   should be 0xFE
+	// 	bySectorData[SectorOffset+1] is track address (should be the same as the nTrack parameter)
+	// 	bySectorData[SectorOffset+2] side number      (should be the same as the nSide parameter)
+	// 	bySectorData[SectorOffset+3] sector number    (should be the same as the nSector parameter)
+	// 	bySectorData[SectorOffset+4] byte length (log 2, minus seven), 0 => 128 bytes; 1 => 256 bytes; etc.
+
+	// For Single Density
+	// 	bySectorData[SectorOffset]   should be 0xFE
+	// 	bySectorData[SectorOffset+1] is track address (should be the same as the nTrack parameter)
+	// 	bySectorData[SectorOffset+2] side number      (should be the same as the nSide parameter)
+	// 	bySectorData[SectorOffset+3] sector number    (should be the same as the nSector parameter)
+	// 	bySectorData[SectorOffset+4] byte length (log 2, minus seven), 0 => 128 bytes; 1 => 256 bytes; etc.
+
+	WORD  wIDAM   = FdcGetIDAM(0);
+	int   nOffset = wIDAM & 0x3FFF;
+	BYTE* pby = g_tdTrack.byTrackData + nOffset;
+
+	if (*(pby-1) == 0xA1)
+	{
+		g_tdTrack.byDensity = eDD;
+	}
+	else
+	{
+		g_tdTrack.byDensity = eSD;
+	}
 }
 /*
 //-----------------------------------------------------------------------------
@@ -794,12 +893,14 @@ void FdcReadTrack(int nDrive, int nSide, int nTrack)
 //-----------------------------------------------------------------------------
 int FindSectorIndex(int nSector, TrackType* ptrack)
 {
-	int i;
+	int i, nOffset;
 
 	// locate sector
 	for (i = 0; i < MAX_SECTORS_PER_TRACK; ++i)
 	{
-		if (ptrack->byTrackData[FdcGetIDAM_Offset(ptrack->nIDAM[i])+6] == nSector)
+		nOffset = FdcGetIDAM_Offset(ptrack->nIDAM[i])+6;
+
+		if ((nOffset < sizeof(ptrack->byTrackData)) && (ptrack->byTrackData[nOffset] == nSector))
 		{
 			return i;
 		}
@@ -809,22 +910,166 @@ int FindSectorIndex(int nSector, TrackType* ptrack)
 }
 
 //-----------------------------------------------------------------------------
-WORD FdcGetDmkSectorCRC(int nDrive, int nDataOffset, int nDensityAdjust)
+WORD FdcGetDmkSectorCRC(int nDrive, int nDataOffset, int nDensityAdjust, int nDataSize)
 {
 	WORD wCRC16;
 
-	wCRC16  = g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+1] << 8;
-	wCRC16 += g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+2];
+	wCRC16  = g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+1*nDataSize] << 8;
+	wCRC16 += g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+2*nDataSize];
 
 	return wCRC16;
 }
 
 //-----------------------------------------------------------------------------
-void FdcReadDmkSector(int nDriveSel, int nSide, int nTrack, int nSector)
+int FdcReadDmkSector1771(int nDriveSel, int nSide, int nTrack, int nSector)
 {
 	BYTE* pby;
-	WORD  wCRC16;
+	WORD  wCalcCRC16;
 	int   nDrive, nDataOffset, nDensityAdjust;
+	int   nDataSize = 1;
+	int   ret = FDC_READ_SECTOR_SUCCESS;
+
+	g_FDC.nDataSize = 1;
+
+	nDrive = FdcGetDriveIndex(nDriveSel);
+	
+	if (nDrive < 0)
+	{
+		return FDC_INVALID_DRIVE;
+	}
+
+	FdcReadTrack(nDrive, nSide, nTrack);
+
+	g_tdTrack.nFileOffset = FdcGetTrackOffset(nDrive, nSide, nTrack);
+
+	int nOffset = FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector]);
+
+	// get pointer to start of sector data
+	pby = g_tdTrack.byTrackData + nOffset;
+
+	if ((*pby == 0xFE) && (*(pby+1) == 0xFE))
+	{
+		nDataSize = 2;
+	}
+
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset-3] should be 0xA1 or 0xF5
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset-2] should be 0xA1 or 0xF5
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset-1] should be 0xA1 or 0xF5
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset+0] should be 0xFE
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset+1] is track address (should be the same as the nTrack parameter)
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset+2] side number		 (should be the same as the nSide parameter)
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset+3] sector number    (should be the same as the nSector parameter)
+	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset+4] byte length (log 2, minus seven), 0 => 128 bytes; 1 => 256 bytes; etc.
+
+	g_FDC.nDataSize = nDataSize;
+
+	if (g_FDC.byCurCommand & 0x08) // IBM format
+	{
+		g_stSector.nSectorSize = 128 << *(pby+4*nDataSize);
+	}
+	else // Non-IBM format
+	{
+		g_stSector.nSectorSize = 16; // 16 << *(pby+4*nDataSize);
+	}
+
+	g_dtDives[nDrive].dmk.nSectorSize = g_stSector.nSectorSize;
+
+	// g_FDC.byTrackData[g_FDC.nSectorOffset+5..6] CRC (calculation starts with the three 0xA1/0xF5 bytes preceeding the 0xFE)
+	FdcClrFlag(eCrcError);
+
+	if (FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector]) <= 0)
+	{
+		g_stSector.nSectorDataOffset = 0; // then there is a problem and we will let the Z80 deal with it
+		FdcSetFlag(eNotFound);
+		return FDC_SECTOR_NOT_FOUND;
+	}
+
+	if (nDataSize == 2)
+	{
+		nDensityAdjust = 0;
+		wCalcCRC16 = Calculate_CRC_CCITT(pby, 5, nDataSize);
+	}
+	else if (g_tdTrack.byDensity == eDD) // double density
+	{
+		nDensityAdjust = 3;
+		wCalcCRC16 = Calculate_CRC_CCITT(pby-3, 8, nDataSize);
+	}
+	else
+	{
+		nDensityAdjust = 0;
+		wCalcCRC16 = Calculate_CRC_CCITT(pby, 5, nDataSize);
+	}
+
+	WORD wCRC16  = 0;
+	int  nIndex1 = FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector])+5*nDataSize;
+	int  nIndex2 = FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector])+6*nDataSize;
+
+	if ((nIndex1 < sizeof(g_tdTrack.byTrackData)) && (nIndex2 < sizeof(g_tdTrack.byTrackData)))
+	{
+		wCRC16 = (g_tdTrack.byTrackData[nIndex1] << 8) + g_tdTrack.byTrackData[nIndex2];
+	}
+
+	if (wCalcCRC16 != wCRC16)
+	{
+		FdcSetFlag(eCrcError);
+		ret = FDC_CRC_ERROR;
+	}
+
+	nDataOffset = g_tdTrack.nDAM[nSector];	// offset to first bytes of the sector data mark sequence (0xA1, 0xA1, 0xA1, 0xFB/0xF8)
+											//  - 0xFB (regular data); or
+											//  - 0xF8 (deleted data)
+											// actual data starts after the 0xFB/0xF8 byte
+	if (nDataOffset < 0)
+	{
+		g_stSector.nSectorDataOffset = 0; // then there is a problem and we will let the Z80 deal with it
+		FdcSetFlag(eNotFound);
+		return FDC_SECTOR_NOT_FOUND;
+	}
+
+	// for double density drives nDataOffset is the index of the first 0xA1 byte in the 0xA1, 0xA1, 0xA1, 0xFB/0xF8 sequence
+	//
+	// for single density 0xA1, 0xA1 and 0xA1 are not present, CRC starts at the data mark (0xFB/0xF8)
+
+	g_FDC.byRecordMark           = g_tdTrack.byTrackData[nDataOffset+nDensityAdjust*nDataSize];
+	g_stSector.nSectorDataOffset = nDataOffset + (nDensityAdjust + 1) * nDataSize;
+	FdcClrFlag(eNotFound);
+	FdcSetRecordType(0xFB);	// will get set to g_FDC.byRecordMark after a few status reads
+
+	// perform a CRC on the sector data (including preceeding 4 bytes) and validate
+	wCalcCRC16 = Calculate_CRC_CCITT(&g_tdTrack.byTrackData[nDataOffset], g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+1, nDataSize);
+
+	if (nDataSize == 2)
+	{
+		int nCrcOffset = g_dtDives[nDrive].dmk.nSectorSize * nDataSize;
+		wCRC16  = g_tdTrack.byTrackData[nDataOffset+nCrcOffset+2] << 8;
+		wCRC16 += g_tdTrack.byTrackData[nDataOffset+nCrcOffset+4];
+	}
+	else if (g_tdTrack.byDensity == eDD) // double density
+	{
+		wCRC16  = g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+1] << 8;
+		wCRC16 += g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+2];
+	}
+	else
+	{
+		wCRC16  = g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+1] << 8;
+		wCRC16 += g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+2];
+	}
+
+	if (wCalcCRC16 != wCRC16)
+	{
+		FdcSetFlag(eCrcError);
+		return FDC_CRC_ERROR;
+	}
+
+	return ret;
+}
+
+//-----------------------------------------------------------------------------
+void FdcReadDmkSector1791(int nDriveSel, int nSide, int nTrack, int nSector)
+{
+	BYTE* pby;
+	WORD  wCalcCRC16;
+	int   nDrive, nDataOffset;
 
 	nDrive = FdcGetDriveIndex(nDriveSel);
 	
@@ -838,7 +1083,9 @@ void FdcReadDmkSector(int nDriveSel, int nSide, int nTrack, int nSector)
 	g_tdTrack.nFileOffset = FdcGetTrackOffset(nDrive, nSide, nTrack);
 
 	// get pointer to start of sector data
-	pby = g_tdTrack.byTrackData + FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector]);
+	int nOffset = FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector]);
+
+	pby = g_tdTrack.byTrackData + nOffset;
 
 	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset-3] should be 0xA1 or 0xF5
 	// g_FDC.byTrackData[nSide][g_FDC.nTrackSectorOffset-2] should be 0xA1 or 0xF5
@@ -858,27 +1105,26 @@ void FdcReadDmkSector(int nDriveSel, int nSide, int nTrack, int nSector)
 	if (FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector]) <= 0)
 	{
 		g_stSector.nSectorDataOffset = 0; // then there is a problem and we will let the Z80 deal with it
-		FdcClrFlag(eRecordType);
 		FdcSetFlag(eNotFound);
 		return;
 	}
 
-	if (g_tdTrack.byDensity == eDD) // double density
-	{
-		nDensityAdjust = 3;
-		wCRC16 = Calculate_CRC_CCITT(pby-3, 8);
-	}
-	else
-	{
-		nDensityAdjust = 0;
-		wCRC16 = Calculate_CRC_CCITT(pby, 5);
-	}
+	wCalcCRC16 = Calculate_CRC_CCITT(pby-3, 8, 1);
 	
-	if (wCRC16 != ((g_tdTrack.byTrackData[FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector])+5] << 8) + g_tdTrack.byTrackData[FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector])+6]))
+	WORD wCRC16  = 0;
+	int  nIndex1 = FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector])+5;
+	int  nIndex2 = FdcGetIDAM_Offset(g_tdTrack.nIDAM[nSector])+6;
+
+	if ((nIndex1 < sizeof(g_tdTrack.byTrackData)) && (nIndex2 < sizeof(g_tdTrack.byTrackData)))
+	{
+		wCRC16 = (g_tdTrack.byTrackData[nIndex1] << 8) + g_tdTrack.byTrackData[nIndex2];
+	}
+
+	if (wCalcCRC16 != wCRC16)
 	{
 		FdcSetFlag(eCrcError);
 	}
-
+	
 	nDataOffset = g_tdTrack.nDAM[nSector];	// offset to first bytes of the sector data mark sequence (0xA1, 0xA1, 0xA1, 0xFB/0xF8)
 											//  - 0xFB (regular data); or
 											//  - 0xF8 (deleted data)
@@ -886,24 +1132,24 @@ void FdcReadDmkSector(int nDriveSel, int nSide, int nTrack, int nSector)
 	if (nDataOffset < 0)
 	{
 		g_stSector.nSectorDataOffset = 0; // then there is a problem and we will let the Z80 deal with it
-		FdcClrFlag(eRecordType);
 		FdcSetFlag(eNotFound);
 		return;
 	}
 
-	// for double denisty drives nDataOffset is the index of the first 0xA1 byte in the 0xA1, 0xA1, 0xA1, 0xFB/0xF8 sequence
-	//
-	// for single denisty 0xA1, 0xA1 and 0xA1 are not present, CRC starts st the data mark (0xFB/0xF8)
+	// nDataOffset is the index of the first 0xA1 byte in the 0xA1, 0xA1, 0xA1, 0xFB/0xF8 sequence
 
-	g_FDC.byRecordMark           = g_tdTrack.byTrackData[nDataOffset+nDensityAdjust];
-	g_stSector.nSectorDataOffset = nDataOffset + nDensityAdjust + 1;
+	g_FDC.byRecordMark           = g_tdTrack.byTrackData[nDataOffset+3];
+	g_stSector.nSectorDataOffset = nDataOffset + 4;
 	FdcClrFlag(eNotFound);
 	FdcSetRecordType(0xFB);	// will get set to g_FDC.byRecordMark after a few status reads
 
 	// perform a CRC on the sector data (including preceeding 4 bytes) and validate
-	wCRC16 = Calculate_CRC_CCITT(&g_tdTrack.byTrackData[nDataOffset], g_dtDives[nDrive].dmk.nSectorSize+nDensityAdjust+1);
+	wCalcCRC16 = Calculate_CRC_CCITT(&g_tdTrack.byTrackData[nDataOffset], g_dtDives[nDrive].dmk.nSectorSize+4, 1);
 
-	if (wCRC16 != FdcGetDmkSectorCRC(nDrive, nDataOffset, nDensityAdjust))
+	wCRC16  = g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+4] << 8;
+	wCRC16 += g_tdTrack.byTrackData[nDataOffset+g_dtDives[nDrive].dmk.nSectorSize+5];
+
+	if (wCalcCRC16 != wCRC16)
 	{
 		FdcSetFlag(eCrcError);
 	}
@@ -938,7 +1184,18 @@ void FdcReadHfeSector(int nDriveSel, int nSide, int nTrack, int nSector)
 
 	g_FDC.byRecordMark           = g_tdTrack.byTrackData[g_tdTrack.nDAM[i] + 3];
 	g_stSector.nSectorDataOffset = g_tdTrack.nDAM[FindSectorIndex(nSector, &g_tdTrack)] + 4;
-	g_stSector.nSectorSize       = 128 << g_tdTrack.byTrackData[FdcGetIDAM_Offset(g_tdTrack.nIDAM[i]) + 7];
+	
+	int nOffset = FdcGetIDAM_Offset(g_tdTrack.nIDAM[i]) + 7;
+
+	if (nOffset < sizeof(g_tdTrack.byTrackData))
+	{
+		g_stSector.nSectorSize = 128 << g_tdTrack.byTrackData[nOffset];
+	}
+	else
+	{
+		g_stSector.nSectorSize = 128; // ?
+	}
+
 	FdcClrFlag(eNotFound);
 	FdcSetRecordType(0xFB);	// will get set to g_FDC.byRecordMark after a few status reads
 }
@@ -953,28 +1210,20 @@ void FdcReadSector(int nDriveSel, int nSide, int nTrack, int nSector)
 	switch (g_dtDives[nDrive].nDriveFormat)
 	{
 		case eDMK:
-			FdcReadDmkSector(nDriveSel, nSide, nTrack, nSector);
+			if (g_FDC.byDoublerEnable && (g_tdTrack.byDensity == eDD))
+			{
+				FdcReadDmkSector1791(nDriveSel, nSide, nTrack, nSector);
+			}
+			else
+			{
+				FdcReadDmkSector1771(nDriveSel, nSide, nTrack, nSector);
+			}
+
 			break;
 
 		case eHFE:
 			FdcReadHfeSector(nDriveSel, nSide, nTrack, nSector);
 			break;
-	}
-}
-
-//-----------------------------------------------------------------------------
-void FdcMountCpmDrive(int nDrive)
-{
-	if (nDrive >= MAX_DRIVES)
-	{
-		return;
-	}
-
-	g_dtDives[nDrive].f = FileOpen(g_dtDives[nDrive].szFileName, FA_READ | FA_WRITE);
-
-	if (g_dtDives[nDrive].f == NULL)
-	{
-		return;
 	}
 }
 
@@ -1063,21 +1312,58 @@ void FdcMountHfeDrive(int nDrive)
 }
 
 //-----------------------------------------------------------------------------
+void FdcMountCpmDrive(int nDrive)
+{
+	if (nDrive >= MAX_DRIVES)
+	{
+		return;
+	}
+
+	g_dtDives[nDrive].f = FileOpen(g_dtDives[nDrive].szFileName, FA_READ | FA_WRITE);
+
+	if (g_dtDives[nDrive].f == NULL)
+	{
+		return;
+	}
+}
+
+//-----------------------------------------------------------------------------
 void FdcMountDrive(int nDrive)
 {
 	g_dtDives[nDrive].nDriveFormat = eUnknown;
 
-	if (stristr(g_dtDives[nDrive].szFileName, (char*)".img") != NULL)
-	{
-		FdcMountCpmDrive(nDrive);
-	}
-	else if (stristr(g_dtDives[nDrive].szFileName, (char*)".dmk") != NULL)
+	if (stristr(g_dtDives[nDrive].szFileName, (char*)".dmk") != NULL)
 	{
 		FdcMountDmkDrive(nDrive);
 	}
 	else if (stristr(g_dtDives[nDrive].szFileName, (char*)".hfe") != NULL)
 	{
 		FdcMountHfeDrive(nDrive);
+	}
+	else if (stristr(g_dtDives[nDrive].szFileName, (char*)".img") != NULL)
+	{
+		FdcMountCpmDrive(nDrive);
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+void FdcProcessConfigEntry(char szLabel[], char* psz)
+{
+	if ((strcmp(szLabel, "DRIVE0") == 0) && (MAX_DRIVES > 0))
+	{
+		CopyString(psz, g_dtDives[0].szFileName, sizeof(g_dtDives[0].szFileName)-2);
+	}
+	else if ((strcmp(szLabel, "DRIVE1") == 0) && (MAX_DRIVES > 1))
+	{
+		CopyString(psz, g_dtDives[1].szFileName, sizeof(g_dtDives[1].szFileName)-2);
+	}
+	else if ((strcmp(szLabel, "DRIVE2") == 0) && (MAX_DRIVES > 2))
+	{
+		CopyString(psz, g_dtDives[2].szFileName, sizeof(g_dtDives[2].szFileName)-2);
+	}
+	else if ((strcmp(szLabel, "DRIVE3") == 0) && (MAX_DRIVES > 3))
+	{
+		CopyString(psz, g_dtDives[3].szFileName, sizeof(g_dtDives[3].szFileName)-2);
 	}
 }
 
@@ -1103,7 +1389,10 @@ void FdcInit(void)
 {
 	int i;
 
+    memset(&g_bFdcRequest, 0, sizeof(g_bFdcRequest));
+    memset(&g_bFdcResponse, 0, sizeof(g_bFdcResponse));
 	memset(&g_FDC, 0, sizeof(g_FDC));
+
 	FdcSetFlag(eBusy);
 
 	g_tdTrack.nDrive = -1;
@@ -1127,20 +1416,32 @@ void FdcInit(void)
 	}
 
 	g_FDC.byCommandReceived = 0;
-	g_FDC.byCommandReg = 255;
-	g_FDC.byCurCommand = 255;
-
-//	g_FDC.bySdCardPresent = sd_byCardInialized;
-	g_FDC.byDriveSel = 0x01;
+	g_FDC.byCommandReg  = 255;
+	g_FDC.byCurCommand  = 255;
+	g_FDC.byDriveSel    = 0x01;
 	g_FDC.byCommandType = 1;
 
-	g_nMaxSeekTime = 0;
+	g_nTimeNow       = time_us_64();
+	g_nPrevTime      = g_nTimeNow;
+	g_byMotorWasOn   = 0;
+	g_nMotorOnTimer  = 0;
+	g_dwRotationTime = 200000;	// 200ms
+	g_dwIndexTime    = 2800;	// 2.8ms
+	g_nRotationCount = 0;
+	g_byRwIndex      = 0;
+	g_szRwBuf[0]     = 0;
+
+	g_byTrackWritePerformed = 0;
 }
 
-//-----------------------------------------------------------------------------
-void FdcGenerateIntr(void)
+//-----------------------------------------------------------------------------	
+void __not_in_flash_func(FdcGenerateIntr)(void)
 {
 	BYTE byNmiMaskReg = g_FDC.byNmiMaskReg;
+
+	g_byIntrRequest   = 1;
+	g_byFdcIntrActive = true;
+	g_byEnableIntr    = true;
 
 	g_FDC.byNmiStatusReg = 0x7F; // inverted state of all bits low except INTRQ
 
@@ -1150,13 +1451,14 @@ void FdcGenerateIntr(void)
 	}
 	else if ((byNmiMaskReg & 0x80) != 0)	// configured to generate NMI output
 	{
-		FdcClrFlag(eIntrRequest);
+//		FdcClrFlag(eIntrRequest);
+		g_byIntrRequest = 0;
 		cpu.nmi = 1;
 	}
 }
 
 //-----------------------------------------------------------------------------
-void FdcGenerateDRQ(void)
+void __not_in_flash_func(FdcGenerateDRQ)(void)
 {
 	FdcSetFlag(eDataRequest);
 }	
@@ -1201,11 +1503,28 @@ void FdcProcessRestoreCommand(void)
 	g_FDC.byCommandType = 1;
 	nDrive = FdcGetDriveIndex(g_FDC.byDriveSel);
 
+	if (g_FDC.byCommandReg & 0x08) // h == 1?
+	{
+		FdcSetFlag(eHeadLoaded);
+	}
+	else
+	{
+		FdcClrFlag(eHeadLoaded);
+	}
+
+	if (g_byTrackWritePerformed)
+	{
+		g_byTrackWritePerformed = 0;
+		FileClose(g_dtDives[nDrive].f);
+		FdcMountDrive(nDrive);
+	}
+
 	FdcReadTrack(nDrive, nSide, 0);
 
-	FdcClrFlag(eBusy);
-	g_FDC.byTrack = 0;
-	FdcGenerateIntr();
+	//FdcClrFlag(eBusy);
+	//g_FDC.byTrack = 0;
+	//FdcGenerateIntr();
+	g_FDC.nProcessFunction = psRestore;
 }
 
 //-----------------------------------------------------------------------------
@@ -1252,6 +1571,16 @@ void FdcProcessSeekCommand(void)
 	int nSide = FdcGetSide(g_FDC.byDriveSel);
 
 	g_FDC.byCommandType = 1;
+
+	if (g_FDC.byCommandReg & 0x08) // h == 1?
+	{
+		FdcSetFlag(eHeadLoaded);
+	}
+	else
+	{
+		FdcClrFlag(eHeadLoaded);
+	}
+
 	nDrive = FdcGetDriveIndex(g_FDC.byDriveSel);
 	
 	if (nDrive != g_tdTrack.nDrive)
@@ -1263,7 +1592,7 @@ void FdcProcessSeekCommand(void)
 	{
 		FdcSetFlag(eSeekError);
 		FdcClrFlag(eBusy);
-		g_FDC.dwStateCounter   = 1;
+		g_FDC.nStateTimer = 0;
 		g_FDC.nProcessFunction = psSeek;
 		return;
 	}
@@ -1283,8 +1612,8 @@ void FdcProcessSeekCommand(void)
 
 	g_FDC.byTrack = g_FDC.byData;
 	FdcClrFlag(eSeekError);
-	FdcClrFlag(eBusy);
-	g_FDC.dwStateCounter   = 10;
+	FdcSetFlag(eBusy);
+	g_FDC.nStateTimer = 0;
 	g_FDC.nProcessFunction = psSeek;
 }
 
@@ -1303,6 +1632,16 @@ void FdcProcessStepCommand(void)
 	int nSide = FdcGetSide(g_FDC.byDriveSel);
 
 	g_FDC.byCommandType = 1;
+
+	if (g_FDC.byCommandReg & 0x08) // h == 1?
+	{
+		FdcSetFlag(eHeadLoaded);
+	}
+	else
+	{
+		FdcClrFlag(eHeadLoaded);
+	}
+
 	nDrive = FdcGetDriveIndex(g_FDC.byDriveSel);
 
 	if ((g_FDC.byCurCommand & 0x04) != 0) // perform verification
@@ -1337,7 +1676,7 @@ void FdcProcessStepCommand(void)
 // u = 1 - update track register; 0 - do not update track register;
 // h = 1 - load head at begining; 0 - unload head at begining;
 // V = 1 - verify on destination track
-// r1/r0 - steppeing motor rate
+// r1/r0 - stepping motor rate
 //
 void FdcProcessStepInCommand(void)
 {
@@ -1347,6 +1686,16 @@ void FdcProcessStepInCommand(void)
 	int  nSide = FdcGetSide(g_FDC.byDriveSel);
 
 	g_FDC.byCommandType = 1;
+
+	if (g_FDC.byCommandReg & 0x08) // h == 1?
+	{
+		FdcSetFlag(eHeadLoaded);
+	}
+	else
+	{
+		FdcClrFlag(eHeadLoaded);
+	}
+
 	g_FDC.nStepDir = 1;
 
 	if ((g_FDC.byCurCommand & 0x04) != 0) // perform verification
@@ -1400,6 +1749,16 @@ void FdcProcessStepOutCommand(void)
 	int  nSide = FdcGetSide(g_FDC.byDriveSel);
 
 	g_FDC.byCommandType = 1;
+
+	if (g_FDC.byCommandReg & 0x08) // h == 1?
+	{
+		FdcSetFlag(eHeadLoaded);
+	}
+	else
+	{
+		FdcClrFlag(eHeadLoaded);
+	}
+
 	g_FDC.nStepDir = -1;
 
 	if ((g_FDC.byCurCommand & 0x04) != 0) // perform verification
@@ -1434,12 +1793,18 @@ void FdcProcessStepOutCommand(void)
 }
 
 //-----------------------------------------------------------------------------
-// Command code 1 0 0 m F2 E F1 0
+// WD1771 Command code 1 0 0 m b E 0 0
 //
-// m  = 0 - single record read; 1 - multiple record read;
-// F2 = 0 - compare for side 0; 1 - compare for side 1;
-// E  = 0 - no delay; 1 - 15 ms delay;
-// F1 = 0 - disable side select compare; 1 - enable side select compare;
+//   m  = 0 - single record read; 1 - multiple record read;
+//   b  = 0 - Non-IBM format (16 to 4096 bytes); 1 - IBM format (128 to 1024 bytes);
+//   E  = 0 - no delay; 1 - 15 ms delay;
+//
+// WD1791 Command code 1 0 0 m S E C 0
+//
+//   m = 0 - single record read; 1 - multiple record read;
+//   S = 0 - compare for side 0; 1 - compare for side 1;
+//   E = 0 - no delay; 1 - 15 ms delay;
+//   C = 0 - disable side select compare; 1 - enable side select compare;
 //
 void FdcProcessReadSectorCommand(void)
 {
@@ -1456,19 +1821,28 @@ void FdcProcessReadSectorCommand(void)
 		return;
 	}		
 	
-	g_FDC.nReadStatusCount       = 0;
-	g_FDC.dwStateCounter         = 1000;
+	g_FDC.nStateTimer = 0;
+
 	FdcClrFlag(eDataRequest);
+	FdcSetFlag(eHeadLoaded);
+
+	if (g_FDC.byCurCommand & 0x10) // read multiple
+	{
+		g_FDC.byMultipleRecords = 1;
+	}
+	else
+	{
+		g_FDC.byMultipleRecords = 0;
+	}
 
 	// number of byte to be transfered to the computer before
 	// setting the Data Address Mark status bit (1 if Deleted Data)
 	g_tdTrack.nReadSize     = g_stSector.nSectorSize;
 	g_tdTrack.pbyReadPtr    = g_tdTrack.byTrackData + g_stSector.nSectorDataOffset;
 	g_tdTrack.nReadCount    = g_tdTrack.nReadSize;
-	g_FDC.nProcessFunction  = psReadSector;
 	g_FDC.nServiceState     = 0;
-	g_FDC.nDataRegReadCount = 0;
-
+	g_FDC.nProcessFunction  = psReadSector;
+	
 	// Note: computer now reads the data register for each of the sector data bytes
 	//       once the last data byte is transfered status bit-5 is set if the
 	//       Data Address Mark corresponds to a Deleted Data Mark.
@@ -1477,45 +1851,44 @@ void FdcProcessReadSectorCommand(void)
 }
 
 //-----------------------------------------------------------------------------
-// Command code 1 0 0 m F2 E F1 a0
+// Command code 1 0 1 m b E a1 a0
 //
-// m  = 0 - single record read; 1 - multiple record read;
-// F2 = 0 - compare for side 0; 1 - compare for side 1;
-// E  = 0 - no delay; 1 - 15 ms delay;
-// F1 = 0 - disable side select compare; 1 - enable side select compare;
-// a0 = 0 - 0xFB (Data Mark); 1 - 0xF8 (Deleted Data Mark);
+// m = 0 - single record read;
+//     1 - multiple record read;
+// b = 0 - Non-IBM format;
+//     1 - IDM format;
+// E = 0 - no delay;
+//     1 - 15 ms delay;
+// a1/a0 = 00 - 0xFB (Data Mark);
+//         01 - 0xFA (user defined);
+//         10 - 0xF9 (use defined);
+//         11 - 0xF8 (Deleted Data Mark);
 //
 void FdcProcessWriteSectorCommand(void)
 {
 	int nSide  = FdcGetSide(g_FDC.byDriveSel);
 	int nDrive = FdcGetDriveIndex(g_FDC.byDriveSel);
+	uint8_t address_mark[] = {0xFB, 0xFA, 0xF9, 0xF8};
 
 	g_FDC.byCommandType = 2;
-	FdcSetRecordType(0xFB);
-	g_FDC.nReadStatusCount = 0;
+	FdcSetRecordType(address_mark[g_FDC.byCurCommand & 0x03]);
+	g_stSector.bySectorDataAddressMark = address_mark[g_FDC.byCurCommand & 0x03];
 
 	// read specified sector so that it can be modified
 	FdcReadSector(g_FDC.byDriveSel, nSide, g_FDC.byTrack, g_FDC.bySector);
 
 	FdcClrFlag(eDataRequest);
-	g_stSector.nSector           = g_FDC.bySector;
-	g_stSector.nSectorSize       = g_dtDives[nDrive].dmk.nSectorSize;
-	g_tdTrack.nFileOffset        = FdcGetTrackOffset(nDrive, nSide, g_FDC.byTrack);
-	g_tdTrack.pbyWritePtr        = g_tdTrack.byTrackData + g_stSector.nSectorDataOffset;
-	g_tdTrack.nWriteCount        = g_stSector.nSectorSize;
-	g_tdTrack.nWriteSize         = g_stSector.nSectorSize;	// number of byte to be transfered to the computer before
-															// setting the Data Address Mark status bit (1 if Deleted Data)
-	g_FDC.nProcessFunction       = psWriteSector;
-	g_FDC.nServiceState          = 0;
+	FdcSetFlag(eHeadLoaded);
 
-	if ((g_FDC.byCurCommand & 0x01) == 0)
-	{
-		g_stSector.bySectorDataAddressMark = 0xFB;
-	}
-	else
-	{
-		g_stSector.bySectorDataAddressMark = 0xF8;
-	}
+	g_stSector.nSector     = g_FDC.bySector;
+	g_stSector.nSectorSize = g_dtDives[nDrive].dmk.nSectorSize;
+	g_tdTrack.nFileOffset  = FdcGetTrackOffset(nDrive, nSide, g_FDC.byTrack);
+	g_tdTrack.pbyWritePtr  = g_tdTrack.byTrackData + g_stSector.nSectorDataOffset;
+	g_tdTrack.nWriteCount  = g_stSector.nSectorSize;
+	g_tdTrack.nWriteSize   = g_stSector.nSectorSize;	// number of byte to be transfered to the computer before
+														// setting the Data Address Mark status bit (1 if Deleted Data)
+	g_FDC.nServiceState    = 0;
+	g_FDC.nProcessFunction = psWriteSector;
 
 	// Note: computer now writes the data register for each of the sector data bytes.
 	//
@@ -1523,9 +1896,7 @@ void FdcProcessWriteSectorCommand(void)
 }
 
 //-----------------------------------------------------------------------------
-// Command code 1 1 0 0 0 E 0 0
-//
-// E = 1 - 15ms delay; 0 - no 15ms delay;
+// Command code 1 1 0 0 0 1 0 0
 //
 void FdcProcessReadAddressCommand(void)
 {
@@ -1540,19 +1911,17 @@ void FdcProcessReadAddressCommand(void)
 	// Byte 5 : CRC1
 	// Byte 6 : CRC2
 
-	g_tdTrack.pbyReadPtr = &g_tdTrack.byTrackData[FdcGetIDAM_Index(0) + 1];
+	g_tdTrack.pbyReadPtr = &g_tdTrack.byTrackData[(FdcGetIDAM(0) & 0x3FFF) + 1];
 	g_tdTrack.nReadSize  = 6;
 	g_tdTrack.nReadCount = 6;
 
-	g_FDC.nReadStatusCount       = 0;
-	g_FDC.dwStateCounter         = 1000;
+	g_FDC.nStateTimer = 0;
 	FdcClrFlag(eDataRequest);
 
 	// number of byte to be transfered to the computer before
 	// setting the Data Address Mark status bit (1 if Deleted Data)
-	g_FDC.nProcessFunction  = psReadSector;
 	g_FDC.nServiceState     = 0;
-	g_FDC.nDataRegReadCount = 0;
+	g_FDC.nProcessFunction  = psReadSector;
 
 	// Note: CRC should be checked during transfer to the computer
 
@@ -1577,49 +1946,79 @@ void FdcProcessForceInterruptCommand(void)
 	g_tdTrack.nWriteSize = 0;
 	g_FDC.byIntrEnable   = g_FDC.byCurCommand & 0x0F;
 	memset(&g_FDC.status, 0, sizeof(g_FDC.status));
+
+    g_FDC.byCurCommand      = g_FDC.byCommandReg;
+    g_FDC.byCommandReceived = 0;
+    g_FDC.nProcessFunction  = psIdle;
 }
 
 //-----------------------------------------------------------------------------
-// Command code 1 1 1 0 0 E 0 0
+// Command code 1 1 1 0 0 1 0 S
 //
-// E = 1 - 15ms delay; 0 - no 15ms delay;
-//
+// S = 1 - Do not synchronize to AM; 0 - Synchronize to AM;
 void FdcProcessReadTrackCommand(void)
 {
+	int nSide  = FdcGetSide(g_FDC.byDriveSel);
+	int nDrive = FdcGetDriveIndex(g_FDC.byDriveSel);
+
 	g_FDC.byCommandType = 3;
+	FdcSetFlag(eHeadLoaded);
+
+	g_tdTrack.nTrack = 255;
+
+	FdcReadTrack(nDrive, nSide, g_FDC.byTrack);
+
+	g_tdTrack.nDrive       = nDrive;
+	g_tdTrack.nSide        = nSide;
+	g_tdTrack.nTrack       = g_FDC.byTrack;
+	g_tdTrack.pbyReadPtr   = g_tdTrack.byTrackData + 0x80;
+	g_tdTrack.nReadSize    = g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength;
+	g_tdTrack.nReadCount   = g_tdTrack.nReadSize;
+	g_FDC.nDataSize        = 1;
+	g_FDC.nServiceState    = 0;
+
+	g_FDC.nProcessFunction = psReadTrack;
 }
 
 //-----------------------------------------------------------------------------
-// Command code 1 1 1 1 0 E 0 0
-//
-// E = 1 - 15ms delay; 0 - no 15ms delay;
+// Command code 1 1 1 1 0 1 0 0
 //
 void FdcProcessWriteTrackCommand(void)
 {
 	int nSide = FdcGetSide(g_FDC.byDriveSel);
 
 	g_FDC.byCommandType = 3;
+	FdcSetFlag(eHeadLoaded);
 	
 	memset(g_tdTrack.byTrackData+0x80, 0, sizeof(g_tdTrack.byTrackData)-0x80);
-	
+
+	if (g_FDC.byDoublerDensity)
+	{
+		g_tdTrack.byDensity = eDD;
+	}
+	else
+	{
+		g_tdTrack.byDensity = eSD;
+	}
+
 	g_tdTrack.nDrive       = FdcGetDriveIndex(g_FDC.byDriveSel);
 	g_tdTrack.nSide        = nSide;
 	g_tdTrack.nTrack       = g_FDC.byTrack;
 	g_tdTrack.pbyWritePtr  = g_tdTrack.byTrackData + 0x80;
-	g_tdTrack.nWriteSize   = g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength;
+	g_tdTrack.nWriteSize   = 3105; //g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength;
 	g_tdTrack.nWriteCount  = g_tdTrack.nWriteSize;
-	g_FDC.nProcessFunction = psWriteTrack;
 	g_FDC.nServiceState    = 0;
+	g_FDC.nProcessFunction = psWriteTrack;
+	//g_byTrackWritePerformed = 1;
 }
 
 //-----------------------------------------------------------------------------
 void FdcProcessMount(void)
 {
-	g_FDC.byCommandType          = 2;
-	g_FDC.nReadStatusCount       = 0;
+	g_FDC.byCommandType    = 2;
 	FdcClrFlag(eDataRequest);
-	g_FDC.nProcessFunction       = psMountImage;
-	g_FDC.nServiceState          = 0;
+	g_FDC.nServiceState    = 0;
+	g_FDC.nProcessFunction = psMountImage;
 
 	// Note: computer now writes the data register for each of the command data bytes.
 	//
@@ -1630,11 +2029,10 @@ void FdcProcessMount(void)
 //-----------------------------------------------------------------------------
 void FdcProcessOpenFile(void)
 {
-	g_FDC.byCommandType          = 2;
-	g_FDC.nReadStatusCount       = 0;
+	g_FDC.byCommandType    = 2;
 	FdcClrFlag(eDataRequest);
-	g_FDC.nProcessFunction       = psOpenFile;
-	g_FDC.nServiceState          = 0;
+	g_FDC.nServiceState    = 0;
+	g_FDC.nProcessFunction = psOpenFile;
 
 	// Note: computer now writes the data register for each of the command data bytes.
 	//
@@ -1645,66 +2043,81 @@ void FdcProcessOpenFile(void)
 //-----------------------------------------------------------------------------
 void FdcProcessCommand(void)
 {
+	memset(&g_FDC.status, 0, sizeof(g_FDC.status));
+	FdcSetFlag(eBusy);
 	g_FDC.nServiceState     = 0;
 	g_FDC.nProcessFunction  = psIdle;
 	g_FDC.byCurCommand      = g_FDC.byCommandReg;
-	g_FDC.byCommandReceived = 0;
 
 	switch (g_FDC.byCurCommand >> 4)
 	{
-		case 0: // Restore																(Type 1 Command)
+		case 0: // Restore									(Type 1 Command)
 			FdcProcessRestoreCommand();
 			break;
 
-		case 1: // Seek																		(Type 1 Command)
+		case 1: // Seek										(Type 1 Command)
 			FdcProcessSeekCommand();
 			break;
 
-		case 2: // Step (don't update track register)			(Type 1 Command)
-		case 3: // Step (update track register)						(Type 1 Command)
+		case 2: // Step (don't update track register)		(Type 1 Command)
+		case 3: // Step (update track register)				(Type 1 Command)
 			FdcProcessStepCommand();
 			break;
 
 		case 4: // Step In (don't update track register)	(Type 1 Command)
-		case 5: // Step In (update track register)				(Type 1 Command)
+		case 5: // Step In (update track register)			(Type 1 Command)
 			FdcProcessStepInCommand();
 			break;
 
 		case 6: // Step Out (don't update track register)	(Type 1 Command)
-		case 7: // Step Out (update track register)				(Type 1 Command)
+		case 7: // Step Out (update track register)			(Type 1 Command)
 			FdcProcessStepOutCommand();
 			break;
 
-		case 8: // Read Sector (single record)						(Type 2 Command)
-		case 9: // Read Sector (multiple record)					(Type 2 Command)
+		case 8: // Read Sector (single record)				(Type 2 Command)
+		case 9: // Read Sector (multiple record)			(Type 2 Command)
 			FdcProcessReadSectorCommand();
 			break;
 
-		case 10: // Write Sector (single record)					(Type 2 Command)
-		case 11: // Write Sector (multiple record)				(Type 2 Command)
+		case 10: // Write Sector (single record)			(Type 2 Command)
+		case 11: // Write Sector (multiple record)			(Type 2 Command)
 			FdcProcessWriteSectorCommand();
 			break;
 
-		case 12: // Read Address													(Type 3 Command)
-			FdcProcessReadAddressCommand();
+		case 12: // Read Address							(Type 3 Command)
+			if (g_FDC.byCommandReg == 0xC4)
+			{
+				FdcProcessReadAddressCommand();
+			}
+
 			break;
 
-		case 13: // Force Interrupt												(Type 4 Command)
+		case 13: // Force Interrupt							(Type 4 Command)
 			FdcProcessForceInterruptCommand();
 			break;
 
-		case 14: // Read Track														(Type 3 Command)
-			FdcProcessReadTrackCommand();
+		case 14: // Read Track								(Type 3 Command)
+			if ((g_FDC.byCommandReg == 0xE4) || (g_FDC.byCommandReg == 0xE5))
+			{
+				FdcProcessReadTrackCommand();
+			}
+
 			break;
 
-		case 15: // Write Track														(Type 3 Command)
-			FdcProcessWriteTrackCommand();
+		case 15: // Write Track								(Type 3 Command)
+			if (g_FDC.byCommandReg == 0xF4)
+			{
+				FdcProcessWriteTrackCommand();
+			}
+
 			break;
 
 		default:
 			memset(&g_FDC.status, 0, sizeof(g_FDC.status));
 			break;
 	}
+
+	g_FDC.byCommandReceived = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -1713,22 +2126,18 @@ void FdcServiceReadSector(void)
 	switch (g_FDC.nServiceState)
 	{
 		case 0:
-			g_FDC.nReadStatusCount = 0;
-			g_FDC.dwStateCounter = 5;
+			g_FDC.nStateTimer = 0;
 			++g_FDC.nServiceState;
 			break;
 
 		case 1: // give host time to get ready for data
-			if (g_FDC.dwStateCounter > 0)
+			if (g_FDC.nStateTimer < 1000) // 1ms
 			{
-				--g_FDC.dwStateCounter;
 				break;
 			}
 
-			FdcSetRecordType(g_FDC.byRecordMark);
-
 			FdcGenerateDRQ();
-			g_FDC.dwStateCounter = 5;
+			g_FDC.nStateTimer = 0;
 			++g_FDC.nServiceState;
 			break;
 
@@ -1738,10 +2147,48 @@ void FdcServiceReadSector(void)
 				break;
 			}
 
-			g_FDC.nReadStatusCount  = 0;
-			FdcClrFlag(eBusy);
-			g_FDC.nProcessFunction  = psIdle;
 			++g_FDC.nServiceState;
+			FdcSetRecordType(g_FDC.byRecordMark);
+			FdcClrFlag(eBusy);
+			FdcGenerateIntr();
+			g_FDC.nProcessFunction = psIdle;
+			break;
+	}
+}
+
+//-----------------------------------------------------------------------------
+void FdcServiceReadTrack(void)
+{
+	switch (g_FDC.nServiceState)
+	{
+		case 0:
+			g_FDC.nStateTimer = 0;
+			++g_FDC.nServiceState;
+			break;
+
+		case 1: // give host time to get ready for data
+			if (g_FDC.nStateTimer < 1000) // 1ms
+			{
+				break;
+			}
+
+			FdcGenerateDRQ();
+			g_FDC.nStateTimer = 0;
+			++g_FDC.nServiceState;
+			break;
+
+		case 2:
+			if (g_tdTrack.nReadCount > 0)
+			{
+				break;
+			}
+
+			++g_FDC.nServiceState;
+			FdcSetRecordType(g_FDC.byRecordMark);
+			FdcClrFlag(eBusy);
+			FdcGenerateDRQ();
+			FdcGenerateIntr();
+			g_FDC.nProcessFunction = psIdle;
 			break;
 	}
 }
@@ -1818,13 +2265,13 @@ void FdcGenerateSectorCRC(int nSector, int nSectorSize)
 	if (g_tdTrack.byDensity == eDD) // double density
 	{
 		// CRC consists of the 0xA1, 0xA1, 0xA1, 0xFB sequence and the sector data
-		wCRC16 = Calculate_CRC_CCITT(&g_tdTrack.byTrackData[nDataOffset], nSectorSize+4);
+		wCRC16 = Calculate_CRC_CCITT(&g_tdTrack.byTrackData[nDataOffset], nSectorSize+4, 1);
 		g_tdTrack.byTrackData[nDataOffset+nSectorSize+4] = wCRC16 >> 8;
 		g_tdTrack.byTrackData[nDataOffset+nSectorSize+5] = wCRC16 & 0xFF;
 	}
 	else // single density
 	{
-		wCRC16 = Calculate_CRC_CCITT(&g_tdTrack.byTrackData[nDataOffset], nSectorSize+1);
+		wCRC16 = Calculate_CRC_CCITT(&g_tdTrack.byTrackData[nDataOffset], nSectorSize+1, 1);
 		g_tdTrack.byTrackData[nDataOffset+nSectorSize+1] = wCRC16 >> 8;
 		g_tdTrack.byTrackData[nDataOffset+nSectorSize+2] = wCRC16 & 0xFF;
 	}
@@ -1833,7 +2280,7 @@ void FdcGenerateSectorCRC(int nSector, int nSectorSize)
 //-----------------------------------------------------------------------------
 void FdcUpdateDataAddressMark(int nSector, int nSectorSize)
 {
-	int  nDataOffset, i;
+	int nDataOffset, i;
 
 	// get offset of the 0xA1, 0xA1, 0xA1, 0xFB sequence that marks the start of sector data
 
@@ -1871,60 +2318,17 @@ void FdcServiceWriteSector(void)
 	switch (g_FDC.nServiceState)
 	{
 		case 0:
-			if ((g_FDC.nReadStatusCount < 25) && (g_FDC.dwStateCounter > 0))
-			{
-				--g_FDC.dwStateCounter;
-				break;
-			}
-
 			// indicate to the Z80 that we are ready for the first data byte
 			FdcGenerateDRQ();
 			++g_FDC.nServiceState;
 			break;
-		
+
 		case 1:
-			if (g_FDC.status.byDataRequest != 0) // wait for byte to be placed in the data register by the Z80
-			{
-				break;
-			}
-
-			g_FDC.dwStateCounter = 10;
-			++g_FDC.nServiceState;
-			break;
-
-		case 2:
-			if ((g_FDC.byWaitOutput == 0) && (g_FDC.dwStateCounter > 0)) // don't wait forever
-			{
-				--g_FDC.dwStateCounter;
-				break;
-			}
-
-			*g_tdTrack.pbyWritePtr = g_FDC.byData;
-
 			if (g_tdTrack.nWriteCount > 0)
 			{
-				++g_tdTrack.pbyWritePtr;
-				--g_tdTrack.nWriteCount;
-
-				if (g_tdTrack.nWriteCount == 0)
-				{
-					++g_FDC.nServiceState;
-					break;
-				}
-				else if (g_tdTrack.nWriteCount == 1)
-				{
-					g_FDC.byHoldWaitOnDataWrite = 1; // request that wait be held after last data write in the write sequnce
-				}
-
-				--g_FDC.nServiceState;
-				FdcGenerateDRQ();
 				break;
 			}
 
-			++g_FDC.nServiceState;
-			break;
-
-		case 3:
 			FdcUpdateDataAddressMark(g_stSector.nSector, g_stSector.nSectorSize);
 			
 			// perform a CRC on the sector data (including preceeding 4 bytes) and update sector CRC value
@@ -1934,13 +2338,12 @@ void FdcServiceWriteSector(void)
 			WriteSectorData(g_stSector.nSector);
 		
 			++g_FDC.nServiceState;
-			g_FDC.dwStateCounter = 5;
+			g_FDC.nStateTimer = 0;
 			break;
 		
-		case 4:
-			if (g_FDC.dwStateCounter > 0)
+		case 2:
+			if (g_FDC.nStateTimer < 1000)
 			{
-			--g_FDC.dwStateCounter;
 				break;
 			}
 
@@ -1953,47 +2356,50 @@ void FdcServiceWriteSector(void)
 }
 
 //-----------------------------------------------------------------------------
-// returns the side the track is specified to be on
-void FdcProcessTrackData(TrackType* ptdTrack)
+void FdcProcessTrackData1771(TrackType* ptdTrack)
 {
 	BYTE* pbyCrcStart = ptdTrack->byTrackData;
-	BYTE* pby = ptdTrack->byTrackData + 0x80;
+	BYTE* pbySrc = ptdTrack->byTrackData + 0x80;
+	BYTE* pbyDst = g_byTrackBuffer;
 	WORD  wCRC16;
 	int   i, nSide = 0;
 
 	for (i = 0x80; i < ptdTrack->nTrackSize; ++i)
 	{
-		switch (*pby)
+		*pbyDst = *pbySrc;
+
+		switch (*pbySrc)
 		{
 			case 0xF5:
-				pbyCrcStart = pby;
-				*pby = 0xA1;
+				pbyCrcStart = pbyDst;
+				*pbyDst = 0xA1;
 				break;
 			
 			case 0xF6:
-				*pby = 0xC2;
+				*pbyDst = 0xC2;
 				break;
 
 			case 0xF7:
 				if (ptdTrack->byDensity == eDD)
 				{
-					wCRC16 = Calculate_CRC_CCITT(pbyCrcStart-2, (int)(pby-pbyCrcStart+2));
+					wCRC16 = Calculate_CRC_CCITT(pbyCrcStart-2, (int)(pbySrc-pbyCrcStart+2), 1);
 				}
 				else
 				{
-					wCRC16 = Calculate_CRC_CCITT(pbyCrcStart, (int)(pby-pbyCrcStart));
+					wCRC16 = Calculate_CRC_CCITT(pbyCrcStart, (int)(pbySrc-pbyCrcStart), 1);
 				}
 
-				*pby = wCRC16 >> 8;
-				++pby;
+				*pbyDst = wCRC16 >> 8;
+				++pbyDst;
 				++i;
-				*pby = wCRC16 & 0xFF;
+				*pbyDst = wCRC16 & 0xFF;
 				break;
 
+			case 0xFA:
 			case 0xFB:
 				if (ptdTrack->byDensity == eSD) // single density
 				{
-					pbyCrcStart = pby;
+					pbyCrcStart = pbySrc;
 				}
 
 				break;
@@ -2001,15 +2407,56 @@ void FdcProcessTrackData(TrackType* ptdTrack)
 			case 0xFE:
 				if (ptdTrack->byDensity == eSD) // single density
 				{
-					pbyCrcStart = pby;
-					ptdTrack->nSide = *(pby+2);
+					pbyCrcStart = pbySrc;
+					ptdTrack->nSide = *(pbySrc+2);
 				}
 
 				break;
 		}
 		
-		++pby;
+		++pbySrc;
+		++pbyDst;
 	}
+
+	memcpy(ptdTrack->byTrackData+0x80, g_byTrackBuffer, sizeof(ptdTrack->byTrackData)-0x80);
+}
+
+//-----------------------------------------------------------------------------
+void FdcProcessTrackData1791(TrackType* ptdTrack)
+{
+	WORD  wCRC16;
+	int   i, j, nCrcStart, nSide = 0;
+
+	j = nCrcStart = 0;
+
+	for (i = 0x80; i < ptdTrack->nTrackSize; ++i)
+	{
+		g_byTrackBuffer[j] = ptdTrack->byTrackData[i];
+
+		switch (ptdTrack->byTrackData[i])
+		{
+			case 0xF5:
+				nCrcStart = j;
+				g_byTrackBuffer[j] = 0xA1;
+				break;
+			
+			case 0xF6:
+				g_byTrackBuffer[j] = 0xC2;
+				break;
+
+			case 0xF7:
+				wCRC16 = Calculate_CRC_CCITT(&g_byTrackBuffer[nCrcStart-2], (int)(j-nCrcStart+2), 1);
+
+				g_byTrackBuffer[j] = wCRC16 >> 8;
+				++j;
+				g_byTrackBuffer[j] = wCRC16 & 0xFF;
+				break;
+		}
+		
+		++j;
+	}
+
+	memcpy(ptdTrack->byTrackData+0x80, g_byTrackBuffer, sizeof(ptdTrack->byTrackData)-0x80);
 }
 
 //-----------------------------------------------------------------------------
@@ -2073,13 +2520,24 @@ void FdcBuildIdamTable(TrackType* ptdTrack)
 }
 
 //-----------------------------------------------------------------------------
+void FdcBuildDataSizeTable(TrackType* ptdTrack)
+{
+	int i;
+	
+	for (i = 0; i < 0x80; ++i)
+	{
+		ptdTrack->nDataSize[i] = FdcGetDataSize(ptdTrack, ptdTrack->nIDAM[i]);
+	}
+}
+
+//-----------------------------------------------------------------------------
 void FdcBuildDamTable(TrackType* ptdTrack)
 {
 	int i;
 	
 	for (i = 0; i < 0x80; ++i)
 	{
-		ptdTrack->nDAM[i] = FdcGetDAM_Offset(ptdTrack, ptdTrack->nIDAM[i]);
+		ptdTrack->nDAM[i] = FdcGetDAM_Offset(ptdTrack, ptdTrack->nIDAM[i], ptdTrack->nDataSize[i]);
 	}
 }
 
@@ -2141,9 +2599,8 @@ void FdcServiceWriteTrack(void)
 	switch (g_FDC.nServiceState)
 	{
 		case 0:
-			if ((g_FDC.nReadStatusCount < 25) && (g_FDC.dwStateCounter > 0))
+			if (g_FDC.nStateTimer < 1000)
 			{
-				--g_FDC.dwStateCounter;
 				break;
 			}
 
@@ -2158,27 +2615,32 @@ void FdcServiceWriteTrack(void)
 				break;
 			}
 
-			FdcProcessTrackData(&g_tdTrack);	// scan track data to generate CRC values
+			if (g_FDC.byDoublerDensity)
+			{
+				FdcProcessTrackData1791(&g_tdTrack);	// scan track data to generate CRC values
+			}
+			else
+			{
+				FdcProcessTrackData1771(&g_tdTrack);	// scan track data to generate CRC values
+			}
+
 			FdcBuildIdamTable(&g_tdTrack);		// scan track data to build the IDAM table
+			FdcBuildDataSizeTable(&g_tdTrack);
 			FdcBuildDamTable(&g_tdTrack);
 
 			// flush track to SD-Card
 			FdcWriteTrack(&g_tdTrack);
 		
-			g_FDC.dwStateCounter = 5;
+			g_FDC.nStateTimer = 0;
 			++g_FDC.nServiceState;
 			break;
 
 		case 2:
-			if (g_FDC.dwStateCounter > 0)
+			if (g_FDC.nStateTimer < 1000)
 			{
-				--g_FDC.dwStateCounter;
 				break;
 			}
 
-			FdcGenerateIntr();
-
-			FdcClrFlag(eBusy);
 			g_FDC.nServiceState    = 0;
 			g_FDC.nProcessFunction = psIdle;
 			break;
@@ -2186,85 +2648,577 @@ void FdcServiceWriteTrack(void)
 }
 
 //-----------------------------------------------------------------------------
-void FdcServiceSeeek(void)
+void FdcServiceSeek(void)
 {
-	if (g_FDC.dwStateCounter > 0)
+	if (g_FDC.nStateTimer < 1000) // 1ms
 	{
-		--g_FDC.dwStateCounter;
 		return;
 	}
 
+	FdcClrFlag(eBusy);
 	FdcGenerateIntr();
 	g_FDC.nProcessFunction = psIdle;
 }
 
 //-----------------------------------------------------------------------------
-// primary data transfer is handled in fdc_isr()
-void FdcServiceSendData(void)
+void SetResponseLength(BufferType* bResponse)
 {
-	if (g_FDC.dwStateCounter > 0) // don't wait forever
-	{
-	--g_FDC.dwStateCounter;
-		return;
-	}
+	int i = (int)strlen((char*)(bResponse->buf));
 
-	FdcClrFlag(eDataRequest);
-	g_FDC.nProcessFunction = psIdle;
-	FdcClrFlag(eBusy);
+	bResponse->cmd[0] = i & 0xFF;
+	bResponse->cmd[1] = (i >> 8) & 0xFF;
 }
 
 //-----------------------------------------------------------------------------
-void FdcServiceStateMachine(void)
+void FdcProcessStatusRequest(byte print)
 {
-	// check if we have a command to process
-	if (g_FDC.byCommandReceived != 0)
+	char szBuf[64];
+	char szLineEnd[4];
+	int  i;
+	
+	if (print)
 	{
-		FdcProcessCommand();
+		strcpy_s(szLineEnd, sizeof(szLineEnd)-1, (char*)"\r\n");
+	}
+	else
+	{
+		strcpy_s(szLineEnd, sizeof(szLineEnd)-1, (char*)"\r");
+	}
+
+    memset(&g_bFdcResponse, 0, sizeof(g_bFdcResponse));
+
+	strcpy_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, (char*)"Pico FDC Version ");
+	strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, g_pszVersion);
+	strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, szLineEnd);
+	strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, (char*)"BootIni=");
+	strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, g_szBootConfig);
+	strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, szLineEnd);
+
+	if (g_byBootConfigModified)
+	{
+		file* f;
+		int   nLen;
+
+		f = FileOpen(g_szBootConfig, FA_READ);
+		
+		if (f == NULL)
+		{
+			strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, (char*)"Unable to open specified ini file");
+		}
+		else
+		{
+			nLen = FileReadLine(f, szBuf, sizeof(szBuf)-2);
+			
+			while (nLen >= 0)
+			{
+				if (nLen > 2)
+				{
+					strcat_s((char*)(g_bFdcResponse.buf),  sizeof(g_bFdcResponse.buf)-1, szBuf);
+					strcat_s((char*)(g_bFdcResponse.buf),  sizeof(g_bFdcResponse.buf)-1, szLineEnd);
+				}
+
+				nLen = FileReadLine(f, szBuf, sizeof(szBuf)-2);
+			}
+			
+			FileClose(f);
+		}
+	}
+	else
+	{
+		for (i = 0; i < MAX_DRIVES; ++i)
+		{
+			sprintf_s(szBuf, sizeof(szBuf)-1, "%d: ", i);
+			strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, szBuf);
+			strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, g_dtDives[i].szFileName);
+			strcat_s((char*)(g_bFdcResponse.buf), sizeof(g_bFdcResponse.buf)-1, szLineEnd);
+		}
+	}
+
+	if (print)
+	{
+		puts((char*)g_bFdcResponse.buf);
+	}
+	else
+	{
+		SetResponseLength(&g_bFdcResponse);
+	}
+}
+
+#ifndef MFC
+
+//-----------------------------------------------------------------------------
+int FdcFileListCmp(const void * a, const void * b)
+{
+	FILINFO* f1 = (FILINFO*) a;
+	FILINFO* f2 = (FILINFO*) b;
+
+	return stricmp(f1->fname, f2->fname);
+}
+
+//-----------------------------------------------------------------------------
+void FdcProcessFindFirst(char* pszFilter, char* pszFolder)
+{
+    FRESULT fr;  // Return value
+	int     i;
+	
+	g_nFindIndex = 0;
+	g_nFindCount = 0;
+
+    memset(&g_bFdcResponse, 0, sizeof(g_bFdcResponse));
+
+	strcpy((char*)(g_bFdcResponse.buf), "too soon");
+
+    memset(&g_dj, 0, sizeof(g_dj));
+    memset(&g_fno, 0, sizeof(g_fno));
+	memset(g_fiFindResults, 0, sizeof(g_fiFindResults));
+
+	strcpy(g_szFindFilter, pszFilter);
+
+    fr = f_findfirst(&g_dj, &g_fno, pszFolder, "*");
+
+    if (FR_OK != fr)
+	{
+		strcpy((char*)(g_bFdcResponse.buf), "No matching file found.");
+        SetResponseLength(&g_bFdcResponse);
+        return;
+    }
+
+	while ((fr == FR_OK) && (g_fno.fname[0] != 0) && (g_nFindCount < FIND_MAX_SIZE))
+	{
+		if ((g_fno.fattrib & AM_DIR) || (g_fno.fattrib & AM_SYS))
+		{
+			// pcAttrib = pcDirectory;
+		}
+		else
+		{
+			if ((g_szFindFilter[0] == '*') || (stristr(g_fno.fname, g_szFindFilter) != NULL))
+			{
+				memcpy(&g_fiFindResults[g_nFindCount], &g_fno, sizeof(FILINFO));
+				++g_nFindCount;
+			}
+		}
+
+		if (g_fno.fname[0] != 0)
+		{
+			fr = f_findnext(&g_dj, &g_fno); /* Search for next item */
+		}
+	}
+
+	f_closedir(&g_dj);
+
+	if (g_nFindCount > 0)
+	{
+		qsort(g_fiFindResults, g_nFindCount, sizeof(FILINFO), FdcFileListCmp);
+
+		sprintf((char*)(g_bFdcResponse.buf), "%2d/%02d/%d %7d ",
+				((g_fiFindResults[g_nFindIndex].fdate >> 5) & 0xF) + 1,
+				(g_fiFindResults[g_nFindIndex].fdate & 0xF) + 1,
+				(g_fiFindResults[g_nFindIndex].fdate >> 9) + 1980,
+				g_fiFindResults[g_nFindIndex].fsize);
+        strcat((char*)(g_bFdcResponse.buf), (char*)g_fiFindResults[g_nFindIndex].fname);
+
+		++g_nFindIndex;
+	}
+
+    SetResponseLength(&g_bFdcResponse);
+}
+
+//-----------------------------------------------------------------------------
+void FdcProcessFindNext(void)
+{
+    FRESULT fr = FR_OK;  /* Return value */
+	BYTE    bFound = FALSE;
+	
+    memset(&g_bFdcResponse, 0, sizeof(g_bFdcResponse));
+
+	if (g_nFindIndex < g_nFindCount)
+	{
+		sprintf((char*)(g_bFdcResponse.buf), "%2d/%02d/%d %7d ",
+				((g_fiFindResults[g_nFindIndex].fdate >> 5) & 0xF) + 1,
+				(g_fiFindResults[g_nFindIndex].fdate & 0xF) + 1,
+				(g_fiFindResults[g_nFindIndex].fdate >> 9) + 1980,
+				g_fiFindResults[g_nFindIndex].fsize);
+        strcat((char*)(g_bFdcResponse.buf), (char*)g_fiFindResults[g_nFindIndex].fname);
+
+		++g_nFindIndex;
+	}
+	
+    SetResponseLength(&g_bFdcResponse);
+}
+
+//-----------------------------------------------------------------------------
+void FdcSaveBootCfg(char* pszIniFile)
+{
+	char szNewIniFile[30];
+	file* f;
+
+	strncpy(szNewIniFile, pszIniFile, sizeof(szNewIniFile)-1);
+
+	StrToUpper(szNewIniFile);
+
+	if (strstr(szNewIniFile, ".INI") == NULL)
+	{
+		strncat(szNewIniFile, ".INI", sizeof(szNewIniFile)-1);
+	}
+
+	if (!FileExists(szNewIniFile))
+	{
+		printf("%s does not exist, boot.cfg not modified.\r\n", szNewIniFile);
 		return;
 	}
 
-	switch (g_FDC.nProcessFunction)
+	f = FileOpen("boot.cfg", FA_WRITE | FA_CREATE_ALWAYS);
+	
+	if (f == NULL)
 	{
-		case psIdle:
+		puts("Unable to open boot.cfg to write selected ini file.");
+		return;
+	}
+
+	g_byBootConfigModified = TRUE;
+
+	FileWrite(f, szNewIniFile, strlen(szNewIniFile));
+	FileClose(f);
+	strcpy(g_szBootConfig, szNewIniFile);
+}
+
+//-----------------------------------------------------------------------------
+void FdcServiceMountImage(void)
+{
+	char* psz;
+	int   nDrive;
+
+	// locate the drive number
+	psz = SkipBlanks((char*)g_bFdcRequest.buf);
+	nDrive = atoi(psz);
+
+	psz = SkipToBlank((char*)psz);
+
+	if (*psz != ' ')
+	{
+		return;
+	}
+
+	psz = SkipBlanks((char*)psz);
+
+	if ((nDrive < 0) || (nDrive >= MAX_DRIVES))
+	{
+		return;
+	}
+
+	// if test if it is an ini file
+	if (stristr(g_bFdcRequest.buf, ".ini"))
+	{
+		FdcSaveBootCfg((char*)psz);
+	}
+	else if (FileExists((char*)psz))
+	{
+		strcpy(g_dtDives[nDrive].szFileName, (char*)psz);
+		FileClose(g_dtDives[nDrive].f);
+		g_dtDives[nDrive].f = NULL;
+		FdcMountDrive(nDrive);
+	}
+
+    FdcProcessStatusRequest(false);
+}
+
+//-----------------------------------------------------------------------------
+void FdcFormatDrive(void)
+{
+	file* f;
+	char* psz;
+	char  buf[256];
+	int   drive = atoi(g_bFdcRequest.buf);
+	int   size, read;
+
+	if (!isdigit((char)g_bFdcRequest.buf[0]))
+	{
+		strcpy((char*)(g_bFdcResponse.buf), "Drive number not specified\n");
+		SetResponseLength(&g_bFdcResponse);
+		return;
+	}
+
+	if ((drive < 0) || (drive > (sizeof(g_dtDives)/sizeof(g_dtDives[0]))))
+	{
+		sprintf(buf, "Invalid drive number %d\n", drive);
+		strcpy((char*)(g_bFdcResponse.buf), buf);
+		SetResponseLength(&g_bFdcResponse);
+		return;
+	}
+
+	if (g_dtDives[drive].f == NULL)
+	{
+		sprintf(buf, "Drive must be mounted to be formated\n");
+		strcpy((char*)(g_bFdcResponse.buf), buf);
+		SetResponseLength(&g_bFdcResponse);
+		return;
+	}
+
+	psz = g_bFdcRequest.buf;
+	psz = SkipBlanks(psz);
+	psz = SkipToBlank(psz);
+	psz = SkipBlanks(psz);
+
+	strcpy(buf, "0:\\FMT\\");
+	strcat(buf, psz);
+
+	if (FR_OK != f_stat(buf, &g_fno))
+	{
+		strcpy((char*)(g_bFdcResponse.buf), "Unable to formatted disk image: ");
+		strcat((char*)(g_bFdcResponse.buf), buf);
+		strcat((char*)(g_bFdcResponse.buf), "\n");
+		SetResponseLength(&g_bFdcResponse);
+		return;
+	}
+
+	f = FileOpen(buf, FA_READ);
+
+	if (f == NULL)
+	{
+		strcpy((char*)(g_bFdcResponse.buf), "Unable to open file: ");
+		strcat((char*)(g_bFdcResponse.buf), buf);
+		strcat((char*)(g_bFdcResponse.buf), "\n");
+		SetResponseLength(&g_bFdcResponse);
+		return;
+	}
+
+	FileClose(g_dtDives[drive].f);
+	g_dtDives[drive].f = NULL;
+
+	g_dtDives[drive].f = FileOpen(g_dtDives[drive].szFileName, FA_WRITE | FA_CREATE_ALWAYS);
+
+	if (g_dtDives[drive].f == NULL)
+	{
+		strcpy((char*)(g_bFdcResponse.buf), "Unable to create new DMK disk image.\n");
+		SetResponseLength(&g_bFdcResponse);
+		return;
+	}
+
+	size = g_fno.fsize;
+
+	while (size > 0)
+	{
+		read = sizeof(g_byTrackBuffer);
+
+		if (read > size)
+		{
+			read = size;
+		}
+
+		FileRead(f, g_byTrackBuffer, read);
+		FileWrite(g_dtDives[drive].f, g_byTrackBuffer, read);
+		size -= read;
+	}
+
+	FileClose(f);
+	FileClose(g_dtDives[drive].f);
+	g_dtDives[drive].f = NULL;
+
+	FdcMountDrive(drive);
+
+	sprintf((char*)(g_bFdcResponse.buf), "Formatting drive %d (%s), complete.\n", drive, g_dtDives[drive].szFileName);
+	SetResponseLength(&g_bFdcResponse);
+}
+
+//-----------------------------------------------------------------------------
+void FdcProcessRequest(void)
+{
+    switch (g_bFdcRequest.cmd[0])
+    {
+        case 0: // do nothing
+            break;
+
+        case 1: // put status in response buffer
+            FdcProcessStatusRequest(false);
+            break;
+
+        case 2: // find first file
+            FdcProcessFindFirst("*", "0:");
+            break;
+
+        case 3: // find next file
+            FdcProcessFindNext();
+            break;
+
+		case 4: // Mount ini, dmk or hfe file
+			FdcServiceMountImage();
 			break;
-		
-		case psReadSector:
-			FdcServiceReadSector();
-			break;
-		
-		case psWriteSector:
-			FdcServiceWriteSector();
-			break;
-		
-		case psWriteTrack:
-			FdcServiceWriteTrack();
-			break;
-		
-		case psSendData:
-			FdcServiceSendData();
+			
+		case 11: // format mounted drive
+			FdcFormatDrive();
 			break;
 
-		case psSeek:
-			FdcServiceSeeek();
+        case 0x80:
+			FdcProcessFindFirst(".INI", "0:");
+            break;
+
+        case 0x81:
+			FdcProcessFindFirst(".DMK", "0:");
+            break;
+
+        case 0x82:
+			FdcProcessFindFirst(".HFE", "0:");
+            break;
+
+        case 0x83:
+			FdcProcessFindFirst(".DMK", "0:\\FMT");
+            break;
+    }
+}
+#endif
+
+//-----------------------------------------------------------------------------
+void FdcUpdateCounters(void)
+{
+	uint64_t nDiff;
+
+	g_nTimeNow  = time_us_64();
+	nDiff       = g_nTimeNow - g_nPrevTime;
+	g_nPrevTime = g_nTimeNow;
+
+	if (g_nMotorOnTimer != 0)
+	{
+		g_byMotorWasOn = 1;
+
+		g_nMotorOnTimer   = CountDown(g_nMotorOnTimer, nDiff);
+		g_nRotationCount += nDiff;
+
+		// (g_dwTimerFrequency / 5) = count to make one full rotation of the diskette (200 ms at 300 RPM)
+		if (g_nRotationCount >= g_dwRotationTime)
+		{
+			g_nRotationCount -= g_dwRotationTime;
+		}
+
+		if (g_nRotationCount < g_dwIndexTime)
+		{
+			FdcSetFlag(eIndex);
+		 	//gpio_put(LED_PIN, 1);
+		}
+		else
+		{
+			FdcClrFlag(eIndex);
+		 	//gpio_put(LED_PIN, 0);
+		}
+	}
+	else
+	{
+        //gpio_put(LED_PIN, 1);
+
+		if (g_byMotorWasOn)
+		{
+			g_byMotorWasOn = 0;
+		}
+	}
+
+	g_FDC.nStateTimer = CountUp(g_FDC.nStateTimer, nDiff);
+}
+
+//-----------------------------------------------------------------------------
+void FdcRestore()
+{
+	switch (g_FDC.nServiceState)
+	{
+		case 0:
+			g_FDC.nStateTimer = 0;
+			++g_FDC.nServiceState;
 			break;
-		
-//		case psMountImage:
-//			FdcServiceMountImage();
-//			break;
-		
-//		case psOpenFile:
-//			FdcServiceOpenFile();
-//			break;
-		
-//		case psWriteFile:
-//			FdcServiceWriteFile();
-//			break;
-		
-//		case psSetTime:
-//			FdcServiceSetTime();
-//			break;
+
+		case 1: // give host time to get ready for data
+			if (g_FDC.nStateTimer < 5000) // 1ms
+			{
+				break;
+			}
+
+			++g_FDC.nServiceState;
+
+			FdcClrFlag(eBusy);
+			g_FDC.byTrack = 0;
+			FdcGenerateIntr();
+			g_FDC.nProcessFunction = psIdle;
+			break;
 	}
 }
+
+//-----------------------------------------------------------------------------
+#ifdef MFC
+	UINT FdcExecute(LPVOID pParm)
+#else
+	void FdcExecute(void)
+#endif
+{
+	g_bStopFdc = false;
+
+	while (!g_bStopFdc)
+	{
+		FdcUpdateCounters();
+		//TestSdCardInsertion();
+
+		// check if we have a command to process
+		if (g_FDC.byCommandReceived != 0)
+		{
+			g_FDC.byCommandType = byCommandTypes[g_FDC.byCommandReg>>4];
+			FdcProcessCommand();
+		}
+
+		switch (g_FDC.nProcessFunction)
+		{
+			case psIdle:
+				break;
+
+			case psReadSector:
+				FdcServiceReadSector();
+				break;
+
+			case psReadTrack:
+				FdcServiceReadTrack();
+				break;
+
+			case psWriteSector:
+				FdcServiceWriteSector();
+				break;
+
+			case psWriteTrack:
+				FdcServiceWriteTrack();
+				break;
+
+			case psSeek:
+				FdcServiceSeek();
+				break;
+
+			case psRestore:
+				FdcRestore();
+				break;
+		}
+	}
+
+#ifdef MFC
+	return TRUE;
+#endif
+}
+
+void StopFdcThread(void)
+{
+	g_bStopFdc = true;
+}
+
+#ifdef ENABLE_LOGGING
+//----------------------------------------------------------------------------
+void PurgeRwBuffer(void)
+{
+	if (g_szRwBuf[0] != 0)
+	{
+		#ifdef MFC
+			strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
+			WriteLogFile(g_szRwBuf);
+		#else
+			puts(g_szRwBuf);
+		#endif
+	}
+
+	g_byRwIndex  = 0;
+	g_szRwBuf[0] = 0;
+}
+#endif
 
 #ifdef ENABLE_LOGGING
 //----------------------------------------------------------------------------
@@ -2274,285 +3228,578 @@ void GetCommandText(char* psz, int nMaxLen, BYTE byCmd)
 
 	if ((byCmd & 0xF0) == 0)         // 0000xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Restore\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Restore", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0x10) // 0001xxxx
 	{
-		sprintf_s(psz, nMaxLen, "    FDC CMD: SEEK 0x%02X, From 0x%02X\r\n", g_FDC.byData, g_FDC.byTrack);
+		sprintf_s(psz, nMaxLen, "CMD: %02X SEEK %02X, From %02X", byCmd, g_FDC.byData, g_FDC.byTrack);
 	}
 	else if ((byCmd & 0xF0) == 0x20) // 0010xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Step, Do Not Update Track Register\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Step, Do Not Update Track Register", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0x30) // 0011xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Step, Update Track Register\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Step, Update Track Register", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0x40) // 0100xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Step In, Do Not Update Track Register\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Step In, Do Not Update Track Register", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0x50) // 0101xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Step In, Update Track Register\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Step In, Update Track Register", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0x60) // 0110xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Step Out, Do Not Update Track Register\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Step Out, Do Not Update Track Register", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0x70) // 0111xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Step Out, Update Track Register\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Step Out, Update Track Register", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0x80) // 1000xxxx
 	{
-		sprintf_s(psz, nMaxLen, "    FDC CMD: DRV: 0x%02X TRK: 0x%02X RSEC: 0x%02X\r\n", g_FDC.byDriveSel, g_FDC.byTrack, g_FDC.bySector);
+		sprintf_s(psz, nMaxLen, "CMD: %02X DRV: %02X TRK: %02X RSEC: %02X", byCmd, g_FDC.byDriveSel, g_FDC.byTrack, g_FDC.bySector);
 	}
 	else if ((byCmd & 0xF0) == 0x90) // 1001xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: RSEC: Multiple Record\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X RSEC: Multiple Record", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0xA0) // 1010xxxx
 	{
-		sprintf_s(psz, nMaxLen, "    FDC CMD: WSEC: 0x%02X TRK: 0x%02X\r\n", g_FDC.bySector, g_FDC.byTrack);
+		sprintf_s(psz, nMaxLen, "CMD: %02X WSEC: %02X TRK: %02X", byCmd, g_FDC.bySector, g_FDC.byTrack);
 	}
 	else if ((byCmd & 0xF0) == 0xB0) // 1011xxxx
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: WSEC: Multiple Record\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X WSEC: Multiple Record", byCmd);
 	}
-	else if ((byCmd & 0xF0) == 0xC0) // 1100xxxx
+	else if (byCmd == 0xC4) // 11000100
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Read Address\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Read Address", byCmd);
 	}
 	else if ((byCmd & 0xF0) == 0xD0) // 1101xxxx
 	{
-		sprintf_s(psz, nMaxLen, "    FDC CMD: Force Interrupt (0x%02X)\r\n", byCmd);
+		sprintf_s(psz, nMaxLen, "CMD: %02X Force Interrupt", byCmd);
 	}
-	else if ((byCmd & 0xF0) == 0xE0) // 1110xxxx
+	else if ((byCmd & 0xFE) == 0xE4) // 1110010x
 	{
-		sprintf_s(psz, nMaxLen, "    FDC CMD: RTRK: 0x%02X\r\n", g_FDC.byTrack);
+		sprintf_s(psz, nMaxLen, "CMD: %02X RTRK: %02X", byCmd, g_FDC.byTrack);
 	}
-	else if ((byCmd & 0xF0) == 0xF0) // 1110xxxx
+	else if (byCmd == 0xF4) // 11110100
 	{
-		sprintf_s(psz, nMaxLen, "    FDC CMD: WTRK: 0x%02X\r\n", g_FDC.byTrack);
+		sprintf_s(psz, nMaxLen, "CMD: %02X WTRK: %02X", byCmd, g_FDC.byTrack);
 	}
 	else
 	{
-		strcpy_s(psz, nMaxLen, "    FDC CMD: Unknown\r\n");
+		sprintf_s(psz, nMaxLen, "CMD: %02X Unknown", byCmd);
 	}
 }
 #endif
 
 //-----------------------------------------------------------------------------
-void fdc_write(word addr, byte byData)
+void __not_in_flash_func(fdc_write_cmd)(byte byData)
 {
-	WORD wReg, wCom;
 #ifdef ENABLE_LOGGING
-  char szBuf[128];
+    char buf[64];
+
+	PurgeRwBuffer();
 #endif
-	wReg = addr & 0x03;
 
-	switch (wReg)
+	g_FDC.byCommandReg = byData;
+
+	if (g_byIntrRequest)
 	{
-		case 0: // command register
-			g_FDC.byCommandReg    = byData;
-			g_FDC.byCommandType   = FdcGetCommandType(byData);
-			g_FDC.byNmiStatusReg  = 0xFF;
+		g_byIntrRequest = 0;
+		g_byFdcIntrActive = false;
+	}
 
-			if (g_FDC.status.byIntrRequest)
+	g_FDC.status.byBusy = 1;
+	g_FDC.byStatus     |= F_BUSY;
+	g_FDC.byCommandReceived = 1;
+
+	if (byData == 0xF4)
+	{
+		g_nRotationCount = g_dwIndexTime + 1;
+		g_FDC.status.byIndex = 0;
+		g_FDC.byStatus  &= ~F_INDEX;
+	}
+
+#ifdef MFC
+//	while (g_FDC.byCommandReceived);
+#endif
+
+#ifdef ENABLE_LOGGING
+	GetCommandText(buf, sizeof(buf), byData);
+
+	#ifdef MFC
+		strcat_s(buf, sizeof(buf)-1, "\r\n");
+		WriteLogFile(buf);
+	#else
+		puts(buf);
+	#endif
+#endif
+}
+
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(fdc_write_track)(byte byData)
+{
+	g_FDC.byTrack = byData;
+
+#ifdef ENABLE_LOGGING
+	PurgeRwBuffer();
+
+	char buf[64];
+    sprintf_s(buf, sizeof(buf)-1, "WR TRACK %02X", byData);
+
+	#ifdef MFC
+		strcat_s(buf, sizeof(buf)-1, "\r\n");
+		WriteLogFile(buf);
+	#else
+		puts(buf);
+	#endif
+#endif
+}
+
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(fdc_write_sector)(byte byData)
+{
+	g_FDC.bySector = byData;
+
+#ifdef ENABLE_LOGGING
+	PurgeRwBuffer();
+#endif
+
+	if (byData >= 0xE0)
+	{
+		g_FDC.byDoublerPrecomp = 1;
+	}
+	else if (byData >= 0xC0)
+	{
+		g_FDC.byDoublerPrecomp = 0;
+	}
+	else if (byData >= 0xA0)
+	{
+		g_FDC.byDoublerEnable  = 0;
+		g_FDC.byDoublerDensity = 0;
+	}
+	else if (byData >= 0x80)
+	{
+		g_FDC.byDoublerEnable  = 1;
+		g_FDC.byDoublerDensity = 1;
+	}
+	else if (byData >= 0x60)
+	{
+		g_FDC.byDoublerSide = 1;
+	}
+	else if (byData >= 0x40)
+	{
+		g_FDC.byDoublerSide = 0;
+	}
+
+#ifdef ENABLE_LOGGING
+	char buf[64];
+    sprintf_s(buf, sizeof(buf)-1, "WR SECTOR %02X", byData);
+
+	#ifdef MFC
+		strcat_s(buf, sizeof(buf)-1, "\r\n");
+		WriteLogFile(buf);
+	#else
+		puts(buf);
+	#endif
+#endif
+}
+
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(fdc_write_data)(byte byData)
+{
+#ifdef ENABLE_LOGGING
+	char t[8];
+#endif
+
+	g_FDC.byData = byData;
+	g_FDC.status.byDataRequest = 0;
+	g_FDC.byStatus &= ~F_DRQ;
+
+	if (g_tdTrack.nWriteCount > 0)
+	{
+		*g_tdTrack.pbyWritePtr = byData;
+		++g_tdTrack.pbyWritePtr;
+		--g_tdTrack.nWriteCount;
+
+		if (g_tdTrack.nWriteCount > 0)
+		{
+			g_FDC.status.byDataRequest = 1;
+			g_FDC.byStatus |= F_DRQ;
+		}
+		else
+		{
+			// FdcGenerateIntr();
+			g_byIntrRequest   = 1;
+			g_byFdcIntrActive = true;
+			g_byEnableIntr    = true;
+
+			// FdcClrFlag(eBusy);
+			g_FDC.status.byBusy = 0;
+			g_FDC.byStatus &= ~F_BUSY;
+		}
+	}
+
+#ifdef ENABLE_LOGGING
+	if (g_byRwIndex == 0)
+	{
+		sprintf_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "WR DATA %02X", byData);
+		++g_byRwIndex;
+	}
+	else if (g_byRwIndex == 15)
+	{
+		sprintf_s(t, sizeof(t)-1, " %02X", byData);
+		strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, t);
+		g_byRwIndex = 0;
+
+		#ifdef MFC
+			strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
+			WriteLogFile(g_szRwBuf);
+		#else
+			puts(g_szRwBuf);
+		#endif
+
+		g_szRwBuf[0] = 0;
+	}
+	else
+	{
+		sprintf_s(t, sizeof(t)-1, " %02X", byData);
+		strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, t);
+		++g_byRwIndex;
+	}
+#endif
+}
+
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(fdc_write)(word addr, byte data)
+{
+    switch (addr)
+    {
+        case 0x37EC:
+            fdc_write_cmd(data);
+			break;
+
+        case 0x37ED:
+            fdc_write_track(data);
+			break;
+
+        case 0x37EE:
+            fdc_write_sector(data);
+			break;
+
+        case 0x37EF:
+            fdc_write_data(data);
+			break;
+    }
+}
+
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(fdc_get_status_string)(char* buf, int nMaxLen, BYTE byStatus)
+{
+	int nDrive;
+
+	nDrive = FdcGetDriveIndex(g_FDC.byDriveSel);
+
+	buf[0] = '|';
+	buf[1] = 0;
+
+	if ((nDrive < 0) || (g_dtDives[nDrive].f == NULL))
+	{
+		strcat_s(buf, nMaxLen, (char*)"F_NOTREADY|F_HEADLOAD");
+	}
+	else if ((g_FDC.byCommandType == 1) || // Restore, Seek, Step, Step In, Step Out
+             (g_FDC.byCommandType == 4))   // Force Interrupt
+	{
+		// S0 (BUSY)
+		if (byStatus & F_BUSY)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_BUSY|");
+		}
+		
+		// S1 (INDEX) default to 0
+		if (byStatus & F_INDEX)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_INDEX|");
+		}
+
+		// S2 (TRACK 0) default to 0
+		if (byStatus & F_TRACK0)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_TRACK0|");
+		}
+
+		// S3 (CRC ERROR) default to 0
+		if (byStatus & F_CRCERR)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_CRCERR|");
+		}
+
+		// S4 (SEEK ERROR) default to 0
+		if (byStatus & F_SEEKERR)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_SEEKERR|");
+		}
+		
+		if (byStatus & F_HEADLOAD)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_HEADLOAD|");
+		}
+
+		// S6 (PROTECTED) default to 0
+		if (byStatus & F_PROTECTED)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_PROTECTED|");
+		}
+		
+		// S7 (NOT READY) default to 0
+		if (byStatus & F_NOTREADY)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_NOTREADY|");
+		}
+	}
+	else if ((g_FDC.byCommandType == 2) ||	// Read Sector, Write Sector
+			 (g_FDC.byCommandType == 3))	// Read Address, Read Track, Write Track
+	{
+		// S0 (BUSY)
+		if (byStatus & F_BUSY)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_BUSY|");
+		}
+	
+		// S1 (DATA REQUEST)     default to 0
+		if (byStatus & F_DRQ)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_DRQ|");
+		}
+
+		// S2 (LOST DATA)        default to 0
+		if (byStatus & F_LOSTDATA)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_LOSTDATA|");
+		}
+		
+		// S3 (CRC ERROR)        default to 0
+		if (byStatus & F_CRCERR)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_CRCERR|");
+		}
+		
+		// S4 (RECORD NOT FOUND) default to 0
+		if (byStatus & F_NOTFOUND)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_NOTFOUND|");
+		}
+	
+		// S5 (RECORD TYPE) default to 0
+		if (byStatus & F_DELETED)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_DELETED|");
+		}
+
+		// S6 (PROTECTED) default to 0
+		if (byStatus & F_PROTECT)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_PROTECT|");
+		}
+
+		// S7 (NOT READY) default to 0
+		if (byStatus & F_NOTREADY)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_NOTREADY|");
+		}
+	}
+	else // Force Interrupt
+	{
+	}
+}
+
+//-----------------------------------------------------------------------------
+byte __not_in_flash_func(fdc_read_status)(void)
+{
+#ifdef ENABLE_LOGGING
+	static BYTE byPrevStatus = 0;
+#endif
+
+#ifdef ENABLE_LOGGING
+	if (byPrevStatus != g_FDC.byStatus)
+	{
+		char buf[64];
+		char buf2[128];
+
+		PurgeRwBuffer();
+
+		fdc_get_status_string(buf, sizeof(buf)-1, g_FDC.byStatus);
+		sprintf_s(buf2, sizeof(buf2)-1, "RD STATUS %02X CMD TYPE %d (%s)", g_FDC.byStatus, g_FDC.byCommandType, buf);
+
+		#ifdef MFC
+			strcat_s(buf2, sizeof(buf2)-1, "\r\n");
+			WriteLogFile(buf2);
+		#else
+			puts(buf2);
+		#endif
+
+		byPrevStatus = g_FDC.byStatus;
+	}
+#endif
+	if (g_byIntrRequest)
+	{
+		g_byIntrRequest = 0;
+		g_byFdcIntrActive = false;
+	}
+
+	return g_FDC.byStatus;
+}
+
+//-----------------------------------------------------------------------------
+byte __not_in_flash_func(fdc_read_track)(void)
+{
+#ifdef ENABLE_LOGGING
+	char buf[64];
+
+	PurgeRwBuffer();
+	sprintf_s(buf, sizeof(buf)-1, "RD TRACK %02X", g_FDC.byTrack);
+
+	#ifdef MFC
+		strcat_s(buf, sizeof(buf)-1, "\r\n");
+		WriteLogFile(buf);
+	#else
+		puts(buf);
+	#endif
+#endif
+	return g_FDC.byTrack;
+}
+
+//-----------------------------------------------------------------------------
+byte __not_in_flash_func(fdc_read_sector)(void)
+{
+#ifdef ENABLE_LOGGING
+	char buf[64];
+
+	PurgeRwBuffer();
+	sprintf_s(buf, sizeof(buf)-1, "RD SECTOR %02X", g_FDC.bySector);
+
+	#ifdef MFC
+		strcat_s(buf, sizeof(buf)-1, "\r\n");
+		WriteLogFile(buf);
+	#else
+		puts(buf);
+	#endif
+#endif
+	return g_FDC.bySector;
+}
+
+//-----------------------------------------------------------------------------
+byte __not_in_flash_func(fdc_read_data)(void)
+{
+#ifdef ENABLE_LOGGING
+	char t[8];
+#endif
+	if (g_tdTrack.nReadCount > 0)
+	{
+		g_FDC.byData = *g_tdTrack.pbyReadPtr;
+		
+		g_FDC.status.byDataRequest = 0;
+		g_FDC.byStatus &= ~F_DRQ;
+
+		g_tdTrack.pbyReadPtr += g_FDC.nDataSize;
+		--g_tdTrack.nReadCount;
+
+		if (g_tdTrack.nReadCount == 0)
+		{
+			if (g_FDC.byMultipleRecords)
 			{
-				g_FDC.byNmiStatusReg = 0xFF; // inverted state of all bits low except INTRQ
-				FdcClrFlag(eIntrRequest);
-			}
+				++g_FDC.bySector;
+#ifdef ENABLE_LOGGING
+				sprintf_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "RD NEXT SECTOR %02X", g_FDC.bySector);
 
-			memset(&g_FDC.status, 0, sizeof(g_FDC.status));
+				#ifdef MFC
+					strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
+					WriteLogFile(g_szRwBuf);
+				#else
+					puts(g_szRwBuf);
+				#endif
 
-			wCom = g_FDC.byCommandReg & 0xF0;
+				g_szRwBuf[0] = 0;
+#endif
+				g_FDC.byCommandReg = 0x98;
 
-			if (wCom == 0xD0) // 0xD0 is Force Interrupt command
-			{
-				g_FDC.byCommandType     = 4;
-				g_tdTrack.nReadSize     = 0;
-				g_tdTrack.nReadCount    = 0;
-				g_tdTrack.nWriteSize    = 0;
-				g_FDC.byCurCommand      = g_FDC.byCommandReg;
-				g_FDC.byIntrEnable      = g_FDC.byCurCommand & 0x0F;
-				g_FDC.nProcessFunction  = psIdle;
-				g_FDC.byCommandReceived = 0;
-				memset(&g_FDC.status, 0, sizeof(g_FDC.status));
-			}
-			else
-			{
+				if (g_byIntrRequest)
+				{
+					g_byIntrRequest = 0;
+					g_byFdcIntrActive = false;
+				}
+
 				g_FDC.byCommandReceived = 1;
-				FdcSetFlag(eBusy);
 			}
-
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-				GetCommandText(szBuf, sizeof(szBuf), byData);
-			}
-#endif
-
-			break;
-
-		case 1: // track register
-			g_FDC.byTrack = byData;
-
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-			  sprintf_s(szBuf, sizeof(szBuf), "    FDC WRITE TRACK %02X\r\n", byData);
-			}
-#endif
-
-			break;
-
-		case 2: // sector register
-			g_FDC.bySector = byData;
-
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-			  sprintf_s(szBuf, sizeof(szBuf), "    FDC WRITE SECTOR %02X\r\n", byData);
-			}
-#endif
-
-			break;
-
-		case 3: // data register
-			g_FDC.byData = byData;
-			FdcClrFlag(eDataRequest);
-
-			if (g_tdTrack.nWriteCount > 0)
-			{
-				*g_tdTrack.pbyWritePtr = byData;
-				++g_tdTrack.pbyWritePtr;
-				--g_tdTrack.nWriteCount;
-
-				if (g_tdTrack.nWriteCount > 0)
-				{
-					FdcGenerateDRQ();
-				}
-			}
-
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-			  sprintf_s(szBuf, sizeof(szBuf), "    FDC WRITE DATA %02X\r\n", byData);
-			}
-#endif
-
-			break;
+		}
+		else
+		{
+			g_FDC.status.byDataRequest = 1;
+			g_FDC.byStatus |= F_DRQ;
+		}
 	}
-
-#ifdef ENABLE_LOGGING
-	if (g_bLogOpen)
+	else
 	{
-		WriteLogFile(szBuf);
+		g_FDC.status.byDataRequest = 0;
+		g_FDC.byStatus |= F_DRQ;
+	}
+
+#ifdef ENABLE_LOGGING
+	if (g_byRwIndex == 0)
+	{
+		sprintf_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "RD DATA %02X", g_FDC.byData);
+		++g_byRwIndex;
+	}
+	else if (g_byRwIndex == 15)
+	{
+		sprintf_s(t, sizeof(t)-1, " %02X", g_FDC.byData);
+		strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, t);
+
+		#ifdef MFC
+			strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
+			WriteLogFile(g_szRwBuf);
+		#else
+			puts(g_szRwBuf);
+		#endif
+
+		g_byRwIndex  = 0;
+		g_szRwBuf[0] = 0;
+	}
+	else
+	{
+		sprintf_s(t, sizeof(t)-1, " %02X", g_FDC.byData);
+		strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, t);
+		++g_byRwIndex;
 	}
 #endif
+
+	return g_FDC.byData;
 }
 
 //-----------------------------------------------------------------------------
-byte fdc_read(word wAddr)
+byte __not_in_flash_func(fdc_read)(uint16_t addr)
 {
-	WORD wReg;
-	BYTE byData = 0;
-#ifdef ENABLE_LOGGING
-  char szBuf[128];
-#endif
+    switch (addr)
+    {
+        case 0x37EC:
+            return fdc_read_status();
 
-	wReg = wAddr & 0x03;
+        case 0x37ED:
+            return fdc_read_track();
 
-	switch (wReg)
-	{
-		case 0:
-			byData = g_FDC.byStatus;
+        case 0x37EE:
+            return fdc_read_sector();
 
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-			  sprintf_s(szBuf, sizeof(szBuf), "    FDC READ STATUS %02X\r\n", byData);
-				WriteLogFile(szBuf);
-			}
-#endif
+        case 0x37EF:
+            return fdc_read_data();
+    }
 
-			++g_FDC.nReadStatusCount;
-
-			if (g_FDC.status.byIntrRequest)
-			{
-				g_FDC.byNmiStatusReg = 0xFF; // inverted state of all bits low except INTRQ
-				FdcClrFlag(eIntrRequest);
-			}
-
-			break;
-
-		case 1:
-			byData = g_FDC.byTrack;
-
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-			  sprintf_s(szBuf, sizeof(szBuf), "    FDC READ TRACK %02X\r\n", byData);
-				WriteLogFile(szBuf);
-			}
-#endif
-
-			break;
-
-		case 2:
-			byData = g_FDC.bySector;
-
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-			  sprintf_s(szBuf, sizeof(szBuf), "    FDC READ SECTOR %02X\r\n", byData);
-				WriteLogFile(szBuf);
-			}
-#endif
-
-			break;
-
-		case 3:
-			if (g_tdTrack.nReadCount > 0)
-			{
-				byData = g_FDC.byData = *g_tdTrack.pbyReadPtr;
-				FdcClrFlag(eDataRequest);
-				++g_FDC.nDataRegReadCount;
-
-				++g_tdTrack.pbyReadPtr;
-				--g_tdTrack.nReadCount;
-
-				if (g_tdTrack.nReadCount == 0)
-				{
-					g_FDC.nDataRegReadCount = 0;
-					FdcGenerateIntr();
-				}
-				else
-				{
-					FdcGenerateDRQ();
-				}
-			}
-			else
-			{
-				byData = g_FDC.byData;
-				FdcClrFlag(eDataRequest);
-				++g_FDC.nDataRegReadCount;
-			}
-
-#ifdef ENABLE_LOGGING
-			if (g_bLogOpen)
-			{
-			  	sprintf_s(szBuf, sizeof(szBuf), "    FDC READ DATA %02X\r\n", byData);
-				WriteLogFile(szBuf);
-			}
-#endif
-
-			break;
-	}
-
-	return byData;
+	return 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -2564,102 +3811,76 @@ byte fdc_read(word wAddr)
 // B5 - PRECOMP (0-no write precompensation; 1-write precompensation enabled)
 // B6 - WSGEN   (0-disable wait state generation; 1-enable wait state generation)
 // B7 - FM/MFM  (0-select single density; 1-select double denisty)
-void fdc_write_drive_select(byte byData)
+void __not_in_flash_func(fdc_write_drive_select)(byte byData)
 {
 #ifdef ENABLE_LOGGING
-  	char szBuf[128];
-
-	if (g_bLogOpen)
+	if (g_FDC.byDriveSel != byData)
 	{
-	  sprintf_s(szBuf, sizeof(szBuf), "    FDC  WR DRVSEL %02X\r\n", byData);
-	  WriteLogFile(szBuf);
+		char buf[64];
+
+	    sprintf_s(buf, sizeof(buf), "WR DRVSEL %02X", byData);
+
+		#ifdef MFC
+			strcat_s(buf, sizeof(buf)-1, "\r\n");
+			WriteLogFile(buf);
+		#else
+			puts(buf);
+		#endif
 	}
 #endif
 
 	g_FDC.byDriveSel = byData;
-
-	// do not allow a wait output if WAITTIMEOUT, INTRQ or DRQ are active
-	if (g_FDC.status.byIntrRequest == 0)
-	{
-		// in "real" hardware the wait is activated on rising edge of the DRV_SEL input
-		// here it is already activated by the PIO code on every FDC read/write operation
-		if ((byData & 0x40) != 0) // activate WAIT
-		{
-			g_FDC.dwWaitTimeoutCount = 2000;
-			g_FDC.byWaitOutput = 1;
-		}
-	}
-
-	int nDrive = FdcGetDriveIndex(byData);
-
-	if (g_dtDives[nDrive].f != NULL)
-	{
-		g_FDC.dwMotorOnTimer = 2000000;
-	}
+	g_nMotorOnTimer  = 2000000;
 }
 
 //-----------------------------------------------------------------------------
-byte fdc_read_nmi(void)
+void __not_in_flash_func(fdc_put_response_byte)(word addr, byte data)
 {
-#ifdef ENABLE_LOGGING
-	if (g_bLogOpen)
+	if (addr < FDC_CMD_SIZE)
 	{
-	  char szBuf[128];
-	  sprintf_s(szBuf, sizeof(szBuf), "    FDC  RD NMI %02X\r\n", g_FDC.byNmiStatusReg);
-	  WriteLogFile(szBuf);
-	}
-#endif
-
-	return g_FDC.byNmiStatusReg;
-}
-
-//-----------------------------------------------------------------------------
-// B7 - ENINTRQ (0-disabled disk INTRQ from generating an NMI)
-// B6 - ENDRQ   (0-disables disk DRQ form generating an NMIM)
-void fdc_write_nmi(byte byData)
-{
-#ifdef ENABLE_LOGGING
-	if (g_bLogOpen)
-	{
-	  char szBuf[128];
-	  sprintf_s(szBuf, sizeof(szBuf), "    FDC  WR NMI %02X\r\n", byData);
-	  WriteLogFile(szBuf);
-	}
-#endif
-
-	g_FDC.byNmiMaskReg = byData;
-
-	if (byData & 0x80)
-	{
-		g_FDC.byNmiMaskReg = byData;
+		g_bFdcResponse.cmd[addr] = data;
 	}
 	else
 	{
-		FdcClrFlag(eIntrRequest);
+		g_bFdcResponse.buf[addr-FDC_CMD_SIZE] = data;
 	}
 }
 
 //-----------------------------------------------------------------------------
-void fdc_process_command_request(byte by)
+byte __not_in_flash_func(fdc_get_response_byte)(word addr)
 {
-	if (by == CPM_READ_BLOCK_CMD) // read the CPM 512-byte block indicated by HL, into memtory indicated by DE
+	if (addr < FDC_CMD_SIZE)
 	{
-		if ((g_FDC.byDriveSel < MAX_DRIVES) && (g_dtDives[g_FDC.byDriveSel].f != NULL))
-		{
-			int nOffset = (cpu.regs.wordregs.hl - CPM_PARTITION_BASE) * CPM_BLOCK_SIZE;
-			FileSeek(g_dtDives[g_FDC.byDriveSel].f, nOffset);
-			FileRead(g_dtDives[g_FDC.byDriveSel].f, g_byMemory+cpu.regs.wordregs.de, CPM_BLOCK_SIZE);
-			cpu.regs.byteregs.a = 0;
-		}
+		return g_bFdcResponse.cmd[addr];
 	}
-	else if (by == CPM_WRITE_BLOCK_CMD)
+	else
 	{
-		if ((g_FDC.byDriveSel < MAX_DRIVES) && (g_dtDives[g_FDC.byDriveSel].f != NULL))
-		{
-			int nOffset = (cpu.regs.wordregs.hl - CPM_PARTITION_BASE) * CPM_BLOCK_SIZE;
-			FileSeek(g_dtDives[g_FDC.byDriveSel].f, nOffset);
-			FileWrite(g_dtDives[g_FDC.byDriveSel].f, g_byMemory+cpu.regs.wordregs.de, CPM_BLOCK_SIZE);
-			cpu.regs.byteregs.a = 0;
-		}
+		return g_bFdcResponse.buf[addr-FDC_CMD_SIZE];
+	}
+}
+
+//-----------------------------------------------------------------------------
+void __not_in_flash_func(fdc_put_request_byte)(word addr, byte data)
+{
+	if (addr < FDC_CMD_SIZE)
+	{
+		g_bFdcRequest.cmd[addr] = data;
+	}
+	else
+	{
+		g_bFdcRequest.buf[addr-FDC_CMD_SIZE] = data;
+	}
+}
+
+//-----------------------------------------------------------------------------
+byte __not_in_flash_func(fdc_get_request_byte)(word addr)
+{
+	if (addr < FDC_CMD_SIZE)
+	{
+		return g_bFdcRequest.cmd[addr];
+	}
+	else
+	{
+		return g_bFdcRequest.buf[addr-FDC_CMD_SIZE];
 	}
 }

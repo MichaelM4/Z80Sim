@@ -17,6 +17,8 @@ int  g_nVideoModified;
 extern byte  g_byKeyboardMemory[0x400];
 extern word  g_wKeyboardStart;
 extern word  g_wKeyboardEnd;
+extern volatile BYTE g_byIntrRequest;
+extern volatile byte g_byFdcIntrActive;
 
 byte  g_byModel1_RtcIntr;
 
@@ -847,17 +849,23 @@ byte Model1_MemRead(word addr)
 		case 0x37E2:
 		case 0x37E3:
 			g_byMemory[addr] = 0x3F;
-      
-      if (g_FDC.status.byIntrRequest)
-      {
-			  g_byMemory[addr] |= 0x40;
-      }
 
-      if (g_byModel1_RtcIntr)
-      {
-			  g_byMemory[addr] |= 0x80;
-        g_byModel1_RtcIntr = 0;
-      }
+			if (g_byIntrRequest)
+			{
+				g_byMemory[addr] |= 0x40;
+			}
+
+			if (g_byModel1_RtcIntr)
+			{
+				g_byMemory[addr] |= 0x80;
+				g_byModel1_RtcIntr = 0;
+
+				if (!g_byFdcIntrActive)
+				{
+					// deactivate intr
+					//clr_gpio(INT_PIN);
+				}
+			}
 
 			break;
 
@@ -919,7 +927,10 @@ void Model1_MemWrite(word addr, byte by)
 		++g_nVideoModified;
 	}
 
-	g_byMemory[addr] = by;
+	if (addr >= 0x3C00)
+	{
+		g_byMemory[addr] = by;
+	}
 }
 
 void Model1_Init(void)
@@ -931,9 +942,9 @@ void Model1_Init(void)
 	g_nModel1_ROM_Size = MODEL1_ROM_SIZE;
 
 	for (i = 0; i < g_nModel1_ROM_Size; ++i)
-  {
-    g_byMemory[i] = g_byModel1_ROM[i];
-  }
+	{
+		g_byMemory[i] = g_byModel1_ROM[i];
+	}
 
 	memset(g_byVideoMemory, 0x20, sizeof(g_byVideoMemory));
 	g_wVideoStart       = 0x3C00;
@@ -943,7 +954,7 @@ void Model1_Init(void)
 	g_nVideoModified    = 0;
 	g_wKeyboardStart    = 0x3800;
 	g_wKeyboardEnd      = 0x3BFF;
-  g_byKeyboardMode    = eKeyMemoryMapped;
+	g_byKeyboardMode    = eKeyMemoryMapped;
 
 	g_FDC.byNmiMaskReg  = 0x80;
 	g_byModel1_RtcIntr  = 0;

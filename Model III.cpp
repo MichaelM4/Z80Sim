@@ -1100,9 +1100,9 @@ byte Model3_InPort(byte port)
       break;
 
     case 0xE4: // RDNMISTATUS
-                // B5 - Reset Status (1-false; 0-true)
-                // B6 - Status of Disk DRQ (1-false; 0-true)
-                // B7 - Status of Disk INTRQ (1-false; 0-true)
+               //   B5 - Reset Status (1-false; 0-true)
+               //   B6 - Status of Disk DRQ (1-false; 0-true)
+               //   B7 - Status of Disk INTRQ (1-false; 0-true)
       return fdc_read_nmi();
       break;
 
@@ -1240,20 +1240,20 @@ void Model3_MemWrite(word addr, byte by)
 		++g_nVideoModified;
 	}
 
-  if (addr >= 0x3C00)
-  {
-    g_byMemory[addr] = by;
-  }
+	if (addr >= 0x3C00)
+	{
+		g_byMemory[addr] = by;
+	}
 }
 
 void Model3_Init(void)
 {
-  int i;
+	int i;
 
-  for (i = 0; i < g_nModel3_ROM_Size; ++i)
-  {
-    g_byMemory[i] = g_byModel3_ROM[i];
-  }
+	for (i = 0; i < g_nModel3_ROM_Size; ++i)
+	{
+		g_byMemory[i] = g_byModel3_ROM[i];
+	}
 
 	memset(g_byVideoMemory, 0x20, sizeof(g_byVideoMemory));
 	g_wVideoStart        = 0x3C00;
@@ -1261,10 +1261,10 @@ void Model3_Init(void)
 	g_byVideoNumCols     = 64;
 	g_byVideoNumRows     = 16;
 	g_nVideoModified     = 0;
-  g_wKeyboardStart     = 0x3800;
+	g_wKeyboardStart     = 0x3800;
 	g_wKeyboardEnd       = 0x3BFF;
-  g_byKeyboardMode     = eKeyMemoryMapped;
-  g_byModel3_IntStatus = 0xFF;
-  g_byModel3_RtcIntr   = 0;
-  g_byModel3_CasIn     = 0;
+	g_byKeyboardMode     = eKeyMemoryMapped;
+	g_byModel3_IntStatus = 0xFF;
+	g_byModel3_RtcIntr   = 0;
+	g_byModel3_CasIn     = 0;
 }

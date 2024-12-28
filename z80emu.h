@@ -3,12 +3,14 @@
 typedef unsigned char byte;
 typedef unsigned short word;
 
-#define CPU_CLOCK 2000000
-#define EXEC_LOOP_COUNT 250                                      // number of clock cycles/states to run in EmuExecute() before execting
+#define CPU_CLOCK 10000000
+
+#define EXEC_LOOP_COUNT 1000                                        // number of clock cycles/states to run in EmuExecute() before execting
 #define EXEC_LOOP_TIME ((EXEC_LOOP_COUNT * 1000000) / CPU_CLOCK) // number of u seconds to run EXEC_LOOP_COUNT states
 
 #define MODEL1_RTC_INTERRUPT_PERIOD (CPU_CLOCK / 40)
 #define MODEL3_RTC_INTERRUPT_PERIOD (CPU_CLOCK / 30)
+#define MODEL_CPM_RTC_INTERRUPT_PERIOD (CPU_CLOCK / 40)
 
 #define VIDEO_BUFFER_SIZE 0x800
 
@@ -108,13 +110,18 @@ typedef struct {
 	uint64_t nExecTickCount;
 } CpuType;
 
-#ifdef MFC
 uint64_t time_us_64(void);
-#endif
 
 void ResetCpu(void);
 void InitSystem(void);
-void EmuExecute(byte bySingleStep);
+
+#ifdef MFC
+	UINT EmuExecute(LPVOID pParm);
+#else
+	void EmuExecute(void);
+#endif
+
+void StopEmuThread(void);
 
 byte Model1_MemRead(word addr);
 void Model1_MemWrite(word addr, byte by);

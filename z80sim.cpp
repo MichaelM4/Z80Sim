@@ -8,6 +8,7 @@
 #include "afxdialogex.h"
 #include "z80sim.h"
 #include "MainFrm.h"
+#include "BreakPointsDlg.h"
 
 #include "z80simDoc.h"
 #include "z80simView.h"
@@ -29,8 +30,8 @@ extern UINT nCharBuffer[];
 extern bool g_bLogOpen;
 extern int  g_nVideoModified;
 extern int  g_nModel;
+extern int  g_nKeyboardReadCount;
 
-void EmuTests(void);
 void LoadIniFile(char* pszFileName);
 
 // CZ80SimApp
@@ -42,11 +43,11 @@ BEGIN_MESSAGE_MAP(CZ80SimApp, CWinAppEx)
 	ON_COMMAND(ID_FILE_OPEN, &CWinAppEx::OnFileOpen)
 	// Standard print setup command
 	ON_COMMAND(ID_FILE_PRINT_SETUP, &CWinAppEx::OnFilePrintSetup)
-	ON_COMMAND(ID_SIMULATE_STEPINTO, &CZ80SimApp::OnSimulateStepinto)
 	ON_COMMAND(ID_SIMULATE_RESTART, &CZ80SimApp::OnSimulateRestart)
 	ON_COMMAND(ID_SIMULATE_GO, &CZ80SimApp::OnSimulateGo)
 	ON_COMMAND(ID_SIMULATE_STOP, &CZ80SimApp::OnSimulateStop)
 	ON_COMMAND(ID_FILE_ENABLELOG, &CZ80SimApp::OnFileEnablelog)
+	ON_COMMAND(ID_SIMULATE_BREAKSPOINTS, &CZ80SimApp::OnSimulateBreakspoints)
 END_MESSAGE_MAP()
 
 // CZ80SimApp construction
@@ -74,6 +75,7 @@ CZ80SimApp::CZ80SimApp() noexcept
 	m_bRun = false;
 
 	m_nLastUpdateTickCount = 0;
+	m_pEmuThread = NULL;
 }
 
 CZ80SimApp::~CZ80SimApp()
@@ -166,10 +168,9 @@ BOOL CZ80SimApp::InitInstance()
 	m_pMainWnd->ShowWindow(SW_SHOW);
 	m_pMainWnd->UpdateWindow();
 
-	SetModel(eModel4);
-//	EmuTests();
+	SetModel(eCpm);
 	FileSystemInit();
-  InitVars();
+	InitVars();
 	InitSystem();
 
 	CString str = AfxGetApp()->GetProfileString(_T("Files"), _T("DefaultIni"), _T(""));
@@ -181,6 +182,8 @@ BOOL CZ80SimApp::InitInstance()
 int CZ80SimApp::ExitInstance()
 {
 	//TODO: handle additional resources you may have added
+	StopFdcThread();
+	StopEmuThread();
 	AfxOleTerm(FALSE);
 
 	return CWinAppEx::ExitInstance();
@@ -285,8 +288,8 @@ void CZ80SimApp::RedrawAllWindows(void)
 
 BOOL CZ80SimApp::OnIdle(LONG lCount)
 {
-	int i = 0;
-	int n = 0;
+	static UINT64 nPrevTickCount = GetTickCount64();
+	UINT64 nTicks;
 
 	// give default handler a chance to perform idle time processing
 	if (CWinAppEx::OnIdle(lCount))
@@ -294,33 +297,18 @@ BOOL CZ80SimApp::OnIdle(LONG lCount)
 		return TRUE;
 	}
 
-	if ((g_byKeyboardMode == eKeyMemoryMapped) && (nCharBufferTail != nCharBufferHead))
+	if ((g_nKeyboardReadCount == 0) && (g_byKeyboardMode == eKeyMemoryMapped) && (nCharBufferTail != nCharBufferHead))
 	{
 		SimulateKeyDown(nCharBuffer[nCharBufferTail]);
 	}
 
-	UINT64 nExecTickCount = GetTickCount64();
-
-	if (g_bLogOpen)
-	{
-		n = 500;
-	}
-	else
-	{
-		n = 50000;
-	}
-
-	while (m_bRun && (i < n) && (g_nVideoModified < 50))
-	{
-		EmuExecute(0);
-		UpdateCounters();
-		FdcServiceStateMachine();
-		++i;
-	}
+	UINT64 nCurrentTickCount = GetTickCount64();
+	nTicks = (nCurrentTickCount - nPrevTickCount);
+	nPrevTickCount = nCurrentTickCount;
 
 	if (m_bRun)
 	{
-		cpu.nExecTickCount += (GetTickCount64() - nExecTickCount);
+		cpu.nExecTickCount += nTicks;
 	}
 
 	if ((g_byKeyboardMode == eKeyMemoryMapped) && (nCharBufferTail != nCharBufferHead))
@@ -335,31 +323,13 @@ BOOL CZ80SimApp::OnIdle(LONG lCount)
 		}
 	}
 
-	if (g_nVideoModified)
+	if (m_nLastUpdateTickCount < nCurrentTickCount)
 	{
-		RedrawAllWindows();
-		g_nVideoModified = 0;
-	}
-	else if (m_nLastUpdateTickCount < nExecTickCount)
-	{
-		m_nLastUpdateTickCount = GetTickCount64() + 50;
+		m_nLastUpdateTickCount = GetTickCount64() + 100;
 		RedrawAllWindows();
 	}
 
 	return m_bRun;
-}
-
-void CZ80SimApp::OnSimulateStepinto()
-{
-	EmuExecute(1);
-	FdcServiceStateMachine();
-	RedrawAllWindows();
-
-	if (m_pMainWnd != NULL)
-	{
-		CMainFrame* pMainFrame = (CMainFrame*)m_pMainWnd;
-		pMainFrame->RedrawCode();
-	}
 }
 
 void CZ80SimApp::OnSimulateRestart()
@@ -374,14 +344,29 @@ void CZ80SimApp::OnSimulateRestart()
 	}
 }
 
+void CZ80SimApp::StartThreads(void)
+{
+	int data = 0;
+	m_pEmuThread = AfxBeginThread(EmuExecute, (LPVOID)&data); 
+	m_pFdcThread = AfxBeginThread(FdcExecute, (LPVOID)&data); 
+	m_bRun = true;
+}
+
+void CZ80SimApp::StopThreads(void)
+{
+	StopFdcThread();
+	StopEmuThread();
+	m_bRun = false;
+}
+
 void CZ80SimApp::OnSimulateGo()
 {
-	m_bRun = true;
+	StartThreads();
 }
 
 void CZ80SimApp::OnSimulateStop()
 {
-	m_bRun = false;
+	StopThreads();
 
 	if (m_pMainWnd != NULL)
 	{
@@ -400,7 +385,7 @@ CDocument* CZ80SimApp::OpenDocumentFile(LPCTSTR lpszFileName)
 	char szFilePath[256];
 	int  i = 0;
 
-	m_bRun = false;
+	StopThreads();
 
 	AfxGetApp()->WriteProfileString(_T("Files"), _T("DefaultIni"), lpszFileName);
 
@@ -414,26 +399,36 @@ CDocument* CZ80SimApp::OpenDocumentFile(LPCTSTR lpszFileName)
 	szFilePath[i] = 0;
 
 	LoadIniFile(szFilePath);
-	m_bRun = true;
+
+	CString str;
 
 	switch (sysdef.nModel)
 	{
 		case eModel1:
-			m_pMainWnd->SetWindowText(_T("Emulating - TRS-80 Model 1"));
+			str = _T("Emulating - TRS-80 Model 1");
 			break;
 
 		case eModel3:
-			m_pMainWnd->SetWindowText(_T("Emulating - TRS-80 Model 3"));
+			str = _T("Emulating - TRS-80 Model 3");
 			break;
 
 		case eModel4:
-			m_pMainWnd->SetWindowText(_T("Emulating - TRS-80 Model 4"));
+			str = _T("Emulating - TRS-80 Model 4");
 			break;
 
 		case eCpm:
-			m_pMainWnd->SetWindowText(_T("Emulating - CPM 2.2"));
+			str = _T("Emulating - CPM 2.2");
 			break;
 	}
+
+	str += _T(", ");
+	str += szFilePath;
+	str += _T(", ");
+	str += sysdef.szDrivePath[0];
+	str += _T(", ");
+	str += sysdef.szDrivePath[1];
+
+	m_pMainWnd->SetWindowText(str);
 
 	if (m_pMainWnd != NULL)
 	{
@@ -441,5 +436,14 @@ CDocument* CZ80SimApp::OpenDocumentFile(LPCTSTR lpszFileName)
 		pMainFrame->UpdateCodeList();
 	}
 
+	StartThreads();
+
 	return NULL;
+}
+
+void CZ80SimApp::OnSimulateBreakspoints()
+{
+	CBreakPointsDlg dlg;
+
+	dlg.DoModal();
 }

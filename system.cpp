@@ -38,7 +38,7 @@ uint64_t g_nTimeEnd;
 uint64_t g_nTimeDiff;
 
 uint32_t g_dwRotationTime;
-uint32_t g_dwIndexTime;
+//uint32_t g_dwIndexTime;
 uint32_t g_dwResetTime;
 uint8_t  g_byMonitorReset;
 
@@ -119,7 +119,7 @@ void WriteLogFile(char* psz)
 void InitVars(void)
 {
 	g_dwRotationTime = 200000;	// 200ms
-	g_dwIndexTime    = (g_dwRotationTime * 5) / 360;	// 5 degrees for index
+//	g_dwIndexTime    = (g_dwRotationTime * 5) / 360;	// 5 degrees for index
 	g_dwResetTime    = 1000;	// 1ms
 	g_byMonitorReset = FALSE;
 
@@ -301,7 +301,7 @@ unsigned long EncodeDateTime(CodedDateTime* pdt)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-uint32_t CountDown(uint32_t nCount, uint32_t nAdjust)
+uint64_t CountDown(uint64_t nCount, uint64_t nAdjust)
 {
 	if (nCount > nAdjust)
 	{
@@ -316,9 +316,9 @@ uint32_t CountDown(uint32_t nCount, uint32_t nAdjust)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-uint32_t CountUp(uint32_t nCount, uint32_t nAdjust)
+uint64_t CountUp(uint64_t nCount, uint64_t nAdjust)
 {
-	if (nCount < (0xFFFFFFFF - nAdjust))
+	if (nCount < (0xFFFFFFFFFFFFFFFF - nAdjust))
 	{
 		nCount += nAdjust;
 	}
@@ -550,104 +550,9 @@ DWORD GetCycDuration(DWORD dwEndCount, DWORD dwStartCount)
 	}
 }
 
-///////////////////////////////////////////////////////////////////////////////
-void UpdateCounters(void)
-{
-	uint32_t nDiff;
-
-	g_nTimeNow = time_us_64();
-
-	if (g_nTimeNow >= g_nPrevTime)
-	{
-		nDiff = (uint32_t)(g_nTimeNow - g_nPrevTime);
-	}
-	else
-	{
-		nDiff = (uint32_t)(0x100000000 - g_nPrevTime + g_nTimeNow);
-	}
-
-	g_nPrevTime = g_nTimeNow;
-
-	if (g_FDC.dwWaitTimeoutCount > 0)
-	{
-		g_FDC.dwWaitTimeoutCount = CountDown(g_FDC.dwWaitTimeoutCount, nDiff);
-		
-		if (g_FDC.dwWaitTimeoutCount == 0) // release wait line
-		{
-		}
-	}
-
-	if (g_FDC.dwMotorOnTimer != 0)
-	{
-		g_byMotorWasOn = 1;
-
-		g_FDC.dwMotorOnTimer  = CountDown(g_FDC.dwMotorOnTimer, nDiff);
-		g_FDC.dwRotationCount = CountUp(g_FDC.dwRotationCount, nDiff);
-
-		// (g_dwTimerFrequency / 5) = count to make one full rotation of the diskette (200 ms at 300 RPM)
-		if (g_FDC.dwRotationCount >= g_dwRotationTime)
-		{
-			g_FDC.dwRotationCount -= g_dwRotationTime;
-		}
-
-		if (g_FDC.dwRotationCount < g_dwIndexTime)
-		{
-			FdcSetFlag(eIndex);
-		}
-		else
-		{
-			FdcClrFlag(eIndex);
-		}
-	}
-	else
-	{
-		if (g_byMotorWasOn)
-		{
-			g_byMotorWasOn = 0;
-		}
-	}
-
-//	if (gpio_get(RESET_PIN) == 0)
-//	{
-//		if (g_byMonitorReset)
-//		{
-//			g_FDC.dwResetCount = CountUp(g_FDC.dwResetCount, nDiff);
-//
-//			if (g_FDC.dwResetCount >= g_dwResetTime) // ~ 1ms duration
-//			{
-//				g_FDC.byResetFDC = 1;
-//			}
-//		}
-//	}
-//	else
-//	{
-//		g_FDC.dwResetCount = 0;
-//		g_byMonitorReset   = TRUE;
-//	}
-
-//	if (g_FDC.dwStateCounter > 0)
-//	{
-//		g_FDC.dwStateCounter = CountDown(g_FDC.dwStateCounter, nDiff);
-//	}
-
-//	if (get_cd())		// 0 => card removed; 1 => card inserted;
-//	{
-//		if (g_dwSdCardPresenceCount < g_dwSdCardMaxPresenceCount)
-//		{
-//			g_dwSdCardPresenceCount = CountUp(g_dwSdCardPresenceCount, nDiff);
-//		}
-//	}
-//	else
-//	{
-//		g_dwSdCardPresenceCount = 0;
-//	}
-}
-
 ////////////////////////////////////////////////////////////////////////////////////
 void ValidateIniPath(char szPath[], int nMaxLen)
 {
-	char szTemp[256];
-
 	if (FileExists(szPath))
 	{
 		return;

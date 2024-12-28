@@ -183,6 +183,7 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="BreakPointsDlg.h" />
     <ClInclude Include="crc.h" />
     <ClInclude Include="datetime.h" />
     <ClInclude Include="defines.h" />
@@ -190,6 +191,7 @@
     <ClInclude Include="file.h" />
     <ClInclude Include="keyboard.h" />
     <ClInclude Include="system.h" />
+    <ClInclude Include="types.h" />
     <ClInclude Include="z80dis.h" />
     <ClInclude Include="z80emu.h" />
     <ClInclude Include="CodePane.h" />
@@ -205,6 +207,7 @@
     <ClInclude Include="z80simView.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="BreakPointsDlg.cpp" />
     <ClCompile Include="cpm.cpp" />
     <ClCompile Include="crc.cpp" />
     <ClCompile Include="fdc.cpp" />

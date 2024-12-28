@@ -1407,7 +1407,7 @@ void Model4_MemWrite(word addr, byte by)
 		return;
 	}
 
-  if (addr < 0x8000)
+	if (addr < 0x8000)
 	{
 		*(g_pbyMemoryBank0+addr) = by;
 	}
@@ -1423,10 +1423,10 @@ void Model4_Init(void)
 
 	g_nModel4_ROM_Size = MODEL4_ROM_SIZE;
 
-  for (i = 0; i < g_nModel4_ROM_Size; ++i)
-  {
-    g_byMemory[i] = g_byModel4_ROM[i];
-  }
+	for (i = 0; i < g_nModel4_ROM_Size; ++i)
+	{
+		g_byMemory[i] = g_byModel4_ROM[i];
+	}
 
 	memset(g_byVideoMemory, 0x20, sizeof(g_byVideoMemory));
 	g_nModel4_ROM_Size   = 0x3800;
@@ -1439,11 +1439,11 @@ void Model4_Init(void)
 	g_wKeyboardEnd       = 0x3BFF;
 	g_pbyMemoryBank0     = g_byMemory;
 	g_pbyMemoryBank1     = g_byMemory+0x8000;
-  g_byModel4_IntStatus = 0xFF;
-  g_byModel4_RtcIntr   = 0;
-  g_byModel4_CasIn     = 0;
+	g_byModel4_IntStatus = 0xFF;
+	g_byModel4_RtcIntr   = 0;
+	g_byModel4_CasIn     = 0;
 	g_byModel4_Page      = 0;
 	g_byMemoryMapSel     = 0;
 	g_byMemoryBankSel    = 0;
-  g_byKeyboardMode     = eKeyMemoryMapped;
+	g_byKeyboardMode     = eKeyMemoryMapped;
 }
