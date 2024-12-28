@@ -187,8 +187,6 @@ void ResetCpu(void)
 
 void GenerateNMI(void)
 {
-  cpu.halt = 0;
-
   // RST 0x0066
   WriteMem(cpu.sp-1, (cpu.pc >> 8) & 0xFF);
   WriteMem(cpu.sp-2, cpu.pc & 0xFF);
@@ -8585,8 +8583,16 @@ void EmuExecInst(byte by)
   {
     word pc = cpu.pc;
     inst[by].inst();
-    cpu.pc = pc + inst[by].bytes;
-    cpu.cycles += inst[by].cycles;
+	
+	if (!cpu.halt)
+	{
+	    cpu.pc = pc + inst[by].bytes;
+		cpu.cycles += inst[by].cycles;
+	}
+	else
+	{
+		cpu.halt = 0;
+	}
   }
 }
 
