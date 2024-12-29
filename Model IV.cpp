@@ -1125,11 +1125,11 @@ void Model4_OutPort(byte port, byte by)
                //  B7 - Undefined
       g_byModel4_IntMaskReg = by;
 
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      sprintf_s(szBuf, sizeof(szBuf), "       OUT WRINTMASKREG %02X\r\n", by);
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       break;
@@ -1145,11 +1145,11 @@ void Model4_OutPort(byte port, byte by)
     case 0xEB: // RS232OUT: UART TxD Register
       g_byModel4_Rs232ControlReg = by;
 
-      if (g_bLogOpen)
+      if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      sprintf_s(szBuf, sizeof(szBuf), "       OUT RS232OUT %02X\r\n", by);
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       break;
@@ -1168,11 +1168,11 @@ void Model4_OutPort(byte port, byte by)
 
       Model4UpdateCasIn();
 
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      sprintf_s(szBuf, sizeof(szBuf), "       OUT MOD OUT %02X\r\n", by);
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       break;
@@ -1189,11 +1189,11 @@ void Model4_OutPort(byte port, byte by)
       break;
 
     case 0xF8: // LPOUT
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      sprintf_s(szBuf, sizeof(szBuf), "       OUT LPOUT %02X\r\n", by);
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       break;
@@ -1207,11 +1207,11 @@ void Model4_OutPort(byte port, byte by)
                //  B5 - Undefined
                //  B6 - Undefined
                //  B7 - Undefined
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      sprintf_s(szBuf, sizeof(szBuf), "       OUT CASOUT %02X\r\n", by);
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       break;
@@ -1233,11 +1233,11 @@ byte Model4_InPort(byte port)
                 //  B5 - RS-232 RxD INT
                 //  B6 - RS-232 error INT
                 //  B7 - Undefined
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      strcpy_s(szBuf, sizeof(szBuf), "       IN RDINTSTATUS\r\n");
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       return g_byModel4_IntStatus;
@@ -1254,21 +1254,21 @@ byte Model4_InPort(byte port)
     case 0xE9: // RS232IN: N.A.
     case 0xEA: // RS232IN: UART Status Register
     case 0xEB: // RS232IN: UART RxD Register
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      strcpy_s(szBuf, sizeof(szBuf), "       IN RS232IN\r\n");
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       break;
 
     case 0xEC: // RTCIN (Clears Reat Time Clock Interrupt)
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      strcpy_s(szBuf, sizeof(szBuf), "       IN RTCIN\r\n");
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       by = g_byModel4_RtcIntr;
@@ -1287,11 +1287,11 @@ byte Model4_InPort(byte port)
     case 0xF5:
     case 0xF6:
     case 0xF7:
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      strcpy_s(szBuf, sizeof(szBuf), "       IN DRVSEL ?\r\n");
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
       break;
 
@@ -1299,11 +1299,11 @@ byte Model4_InPort(byte port)
                //       B5 = UNIT SELECT (1=true; 0=false)
                //       B6 = OUTPAPER (1=true; 0=false)
                //       B7 = BUSY (1=true; 0=false)
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      strcpy_s(szBuf, sizeof(szBuf), "       IN LPIN\r\n");
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       break;
@@ -1317,11 +1317,11 @@ byte Model4_InPort(byte port)
                //  B5 - DISWAIT state
                //  B6 - Undefined
                //  B7 - 500 Baud Cassette bit state
-	    if (g_bLogOpen)
+	    if (g_bCpuLogOpen)
 	    {
 	      char szBuf[128];
 	      sprintf_s(szBuf, sizeof(szBuf), "       IN CAS IN %02X\r\n", g_byModel4_CasIn);
-	      WriteLogFile(szBuf);
+	      WriteCpuLogFile(szBuf);
 	    }
 
       return g_byModel4_CasIn;
@@ -1358,11 +1358,11 @@ byte Model4_MemRead(word addr)
 	}
 
 #ifdef ENABLE_LOGGING
-  if (g_bLogOpen)
+  if (g_bCpuLogOpen)
   {
      char szBuf[128];
      sprintf_s(szBuf, sizeof(szBuf), "     RD %04X => %02X\r\n", addr, byRet);
-     WriteLogFile(szBuf);
+     WriteCpuLogFile(szBuf);
   }
 #endif
 
@@ -1387,11 +1387,11 @@ byte Model4_MemRead(word addr)
 void Model4_MemWrite(word addr, byte by)
 {
 #ifdef ENABLE_LOGGING
-  if (g_bLogOpen)
+  if (g_bCpuLogOpen)
   {
      char szBuf[128];
      sprintf_s(szBuf, sizeof(szBuf), "     WR %04X <= %02X\r\n", addr, by);
-     WriteLogFile(szBuf);
+     WriteCpuLogFile(szBuf);
   }
 #endif
 

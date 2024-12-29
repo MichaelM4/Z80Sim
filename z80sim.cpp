@@ -27,7 +27,6 @@ extern int  nCharBufferHead;
 extern int  nCharBufferTail;
 extern int  nCharBufferSize;
 extern UINT nCharBuffer[];
-extern bool g_bLogOpen;
 extern int  g_nVideoModified;
 extern int  g_nModel;
 extern int  g_nKeyboardReadCount;
@@ -46,8 +45,11 @@ BEGIN_MESSAGE_MAP(CZ80SimApp, CWinAppEx)
 	ON_COMMAND(ID_SIMULATE_RESTART, &CZ80SimApp::OnSimulateRestart)
 	ON_COMMAND(ID_SIMULATE_GO, &CZ80SimApp::OnSimulateGo)
 	ON_COMMAND(ID_SIMULATE_STOP, &CZ80SimApp::OnSimulateStop)
-	ON_COMMAND(ID_FILE_ENABLELOG, &CZ80SimApp::OnFileEnablelog)
 	ON_COMMAND(ID_SIMULATE_BREAKSPOINTS, &CZ80SimApp::OnSimulateBreakspoints)
+	ON_COMMAND(ID_FILE_ENABLELOG, &CZ80SimApp::OnFileEnablelog)
+	ON_UPDATE_COMMAND_UI(ID_FILE_ENABLELOG, &CZ80SimApp::OnUpdateFileEnablelog)
+	ON_COMMAND(ID_FILE_ENABLEFDCLOG, &CZ80SimApp::OnFileEnableFdcLog)
+	ON_UPDATE_COMMAND_UI(ID_FILE_ENABLEFDCLOG, &CZ80SimApp::OnUpdateFileEnablefdclog)
 END_MESSAGE_MAP()
 
 // CZ80SimApp construction
@@ -80,7 +82,7 @@ CZ80SimApp::CZ80SimApp() noexcept
 
 CZ80SimApp::~CZ80SimApp()
 {
-	CloseLogFile();
+	CloseCpuLogFile();
 }
 
 // The one and only CZ80SimApp object
@@ -377,7 +379,50 @@ void CZ80SimApp::OnSimulateStop()
 
 void CZ80SimApp::OnFileEnablelog()
 {
-	OpenLogFile();
+	if (g_bCpuLogOpen)
+	{
+		CloseCpuLogFile();
+	}
+	else
+	{
+		OpenCpuLogFile();
+	}
+}
+
+void CZ80SimApp::OnUpdateFileEnablelog(CCmdUI* pCmdUI)
+{
+	if (g_bCpuLogOpen)
+	{
+		pCmdUI->SetCheck(1);
+	}
+	else
+	{
+		pCmdUI->SetCheck(0);
+	}
+}
+
+void CZ80SimApp::OnFileEnableFdcLog()
+{
+	if (g_bFdcLogOpen)
+	{
+		CloseFdcLogFile();
+	}
+	else
+	{
+		OpenFdcLogFile();
+	}
+}
+
+void CZ80SimApp::OnUpdateFileEnablefdclog(CCmdUI* pCmdUI)
+{
+	if (g_bFdcLogOpen)
+	{
+		pCmdUI->SetCheck(1);
+	}
+	else
+	{
+		pCmdUI->SetCheck(0);
+	}
 }
 
 CDocument* CZ80SimApp::OpenDocumentFile(LPCTSTR lpszFileName)

@@ -24,15 +24,15 @@ typedef struct {
 
 // variables
 
-extern bool g_bLogOpen;
+extern bool g_bCpuLogOpen;
 extern SystemType sysdef;
 
 // function definitions
 //-----------------------------------------------------------------------------
 
-void OpenLogFile(void);
-void CloseLogFile(void);
-void WriteLogFile(char* psz);
+void OpenCpuLogFile(void);
+void CloseCpuLogFile(void);
+void WriteCpuLogFile(char* psz);
 
 uint32_t GetCycDuration(uint32_t dwStart, uint32_t dwEnd);
 void  StartStopWatch(void);

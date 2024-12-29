@@ -54,63 +54,63 @@ SystemType sysdef;
 
 #ifdef MFC
 
-CFile g_fLog;
-bool  g_bLogOpen = false;
+CFile g_fCpuLog;
+bool  g_bCpuLogOpen = false;
 
-char  g_szLogBuffer[0x40000];
-int   g_nLogHead = 0;
+char  g_szCpuLogBuffer[0x40000];
+int   g_nCpuLogHead = 0;
 
-void OpenLogFile(void)
+void OpenCpuLogFile(void)
 {
-	if (g_bLogOpen)
+	if (g_bCpuLogOpen)
 	{
 		return;
 	}
 
-	if (!g_fLog.Open(_T("D:\\TRS-80\\Projects\\z80sim\\Z80.txt"), CFile::modeWrite | CFile::modeCreate | CFile::typeBinary))
+	if (!g_fCpuLog.Open(_T("D:\\Temp\\Z80.txt"), CFile::modeWrite | CFile::modeCreate | CFile::typeBinary))
 	{
 		return;
 	}
 
-	g_nLogHead = 0;
-	g_bLogOpen = true;
-	g_szLogBuffer[0] = 0;
+	g_nCpuLogHead = 0;
+	g_bCpuLogOpen = true;
+	g_szCpuLogBuffer[0] = 0;
 }
 
-void CloseLogFile(void)
+void CloseCpuLogFile(void)
 {
-	if (!g_bLogOpen)
+	if (!g_bCpuLogOpen)
 	{
 		return;
 	}
 
-	if (g_nLogHead > 0)
+	if (g_nCpuLogHead > 0)
 	{
-		g_fLog.Write(g_szLogBuffer, g_nLogHead);
+		g_fCpuLog.Write(g_szCpuLogBuffer, g_nCpuLogHead);
 	}
 
-	g_fLog.Close();
-	g_bLogOpen = false;
+	g_fCpuLog.Close();
+	g_bCpuLogOpen = false;
 }
 
-void WriteLogFile(char* psz)
+void WriteCpuLogFile(char* psz)
 {
-	if (!g_bLogOpen)
+	if (!g_bCpuLogOpen)
 	{
 		return;
 	}
 
 	int nLen = (int)strlen(psz);
 
-	if ((nLen + g_nLogHead) >= (sizeof(g_szLogBuffer) - 20))
+	if ((nLen + g_nCpuLogHead) >= (sizeof(g_szCpuLogBuffer) - 20))
 	{
-		g_fLog.Write(g_szLogBuffer, g_nLogHead);
-		g_nLogHead = 0;
-		g_szLogBuffer[0] = 0;
+		g_fCpuLog.Write(g_szCpuLogBuffer, g_nCpuLogHead);
+		g_nCpuLogHead = 0;
+		g_szCpuLogBuffer[0] = 0;
 	}
 
-	strcpy_s(g_szLogBuffer+g_nLogHead, sizeof(g_szLogBuffer)-g_nLogHead, psz);
-	g_nLogHead += nLen;
+	strcpy_s(g_szCpuLogBuffer+g_nCpuLogHead, sizeof(g_szCpuLogBuffer)-g_nCpuLogHead, psz);
+	g_nCpuLogHead += nLen;
 }
 
 #endif

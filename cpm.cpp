@@ -43,12 +43,9 @@ byte fdc_read_nmi(void)
 void fdc_write_nmi(byte byData)
 {
 #ifdef ENABLE_LOGGING
-	if (g_bLogOpen)
-	{
-	  char szBuf[128];
-	  sprintf_s(szBuf, sizeof(szBuf), "    FDC  WR NMI %02X\r\n", byData);
-	  WriteLogFile(szBuf);
-	}
+	char szBuf[128];
+	sprintf_s(szBuf, sizeof(szBuf), "    FDC  WR NMI %02X\r\n", byData);
+	WriteCpuLogFile(szBuf);
 #endif
 
 	g_FDC.byNmiMaskReg = byData;
@@ -229,32 +226,26 @@ byte CPM_InPort16(byte port, byte addr)
 
 byte CPM_MemRead(word addr)
 {
-  byte byRet = g_byMemory[addr];
+	byte byRet = g_byMemory[addr];
 
 #ifdef ENABLE_LOGGING
-  if (g_bLogOpen)
-  {
-     char szBuf[128];
-     sprintf_s(szBuf, sizeof(szBuf), "     RD %04X => %02X\r\n", addr, byRet);
-     WriteLogFile(szBuf);
-  }
+	char szBuf[128];
+	sprintf_s(szBuf, sizeof(szBuf), "     RD %04X => %02X\r\n", addr, byRet);
+	WriteCpuLogFile(szBuf);
 #endif
 
-  return byRet;
+	return byRet;
 }
 
 void CPM_MemWrite(word addr, byte by)
 {
 #ifdef ENABLE_LOGGING
-  if (g_bLogOpen)
-  {
-     char szBuf[128];
-     sprintf_s(szBuf, sizeof(szBuf), "     WR %04X <= %02X\r\n", addr, by);
-     WriteLogFile(szBuf);
-  }
+	char szBuf[128];
+	sprintf_s(szBuf, sizeof(szBuf), "     WR %04X <= %02X\r\n", addr, by);
+	WriteCpuLogFile(szBuf);
 #endif
 
-  g_byMemory[addr] = by;
+	g_byMemory[addr] = by;
 }
 
 void CPM_Init(void)

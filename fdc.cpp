@@ -25,12 +25,72 @@
 
 	extern CpuType cpu;
 	extern int     g_nModel;
-	extern byte    g_byMemory[0x10000];
 
 	#define __not_in_flash_func(x) x
 #endif
 
-extern bool g_bLogOpen;
+#ifdef MFC
+
+CFile g_fFdcLog;
+bool  g_bFdcLogOpen = false;
+
+char  g_szFdcLogBuffer[0x40000];
+int   g_nFdcLogHead = 0;
+
+void OpenFdcLogFile(void)
+{
+	if (g_bFdcLogOpen)
+	{
+		return;
+	}
+
+	if (!g_fFdcLog.Open(_T("D:\\Temp\\FDC.txt"), CFile::modeWrite | CFile::modeCreate | CFile::typeBinary))
+	{
+		return;
+	}
+
+	g_nFdcLogHead = 0;
+	g_bFdcLogOpen = true;
+	g_szFdcLogBuffer[0] = 0;
+}
+
+void CloseFdcLogFile(void)
+{
+	if (!g_bFdcLogOpen)
+	{
+		return;
+	}
+
+	if (g_nFdcLogHead > 0)
+	{
+		g_fFdcLog.Write(g_szFdcLogBuffer, g_nFdcLogHead);
+	}
+
+	g_fFdcLog.Close();
+	g_bFdcLogOpen = false;
+}
+
+void WriteFdcLogFile(char* psz)
+{
+	if (!g_bFdcLogOpen)
+	{
+		return;
+	}
+
+	int nLen = (int)strlen(psz);
+
+	if ((nLen + g_nFdcLogHead) >= (sizeof(g_szFdcLogBuffer) - 20))
+	{
+		g_fFdcLog.Write(g_szFdcLogBuffer, g_nFdcLogHead);
+		g_nFdcLogHead = 0;
+		g_szFdcLogBuffer[0] = 0;
+	}
+
+	strcpy_s(g_szFdcLogBuffer+g_nFdcLogHead, sizeof(g_szFdcLogBuffer)-g_nFdcLogHead, psz);
+	g_nFdcLogHead += nLen;
+}
+
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////
 /*
@@ -1985,7 +2045,8 @@ void FdcProcessReadTrackCommand(void)
 //
 void FdcProcessWriteTrackCommand(void)
 {
-	int nSide = FdcGetSide(g_FDC.byDriveSel);
+	word nWriteSize;
+	int  nSide = FdcGetSide(g_FDC.byDriveSel);
 
 	g_FDC.byCommandType = 3;
 	FdcSetFlag(eHeadLoaded);
@@ -1995,21 +2056,34 @@ void FdcProcessWriteTrackCommand(void)
 	if (g_FDC.byDoublerDensity)
 	{
 		g_tdTrack.byDensity = eDD;
+		nWriteSize = 6214;
 	}
 	else
 	{
 		g_tdTrack.byDensity = eSD;
+		nWriteSize = 3105;
+	}
+
+	if (nWriteSize != g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength)
+	{
+		g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength = nWriteSize;
+		g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader[3] = g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength >> 8;
+		g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader[2] = g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength & 0xFF;
+
+		FileSeek(g_dtDives[g_tdTrack.nDrive].f, 0);
+		FileWrite(g_dtDives[g_tdTrack.nDrive].f, g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader, sizeof(g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader));
+		FileFlush(g_dtDives[g_tdTrack.nDrive].f);
 	}
 
 	g_tdTrack.nDrive       = FdcGetDriveIndex(g_FDC.byDriveSel);
 	g_tdTrack.nSide        = nSide;
 	g_tdTrack.nTrack       = g_FDC.byTrack;
 	g_tdTrack.pbyWritePtr  = g_tdTrack.byTrackData + 0x80;
-	g_tdTrack.nWriteSize   = 3105; //g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength;
+	g_tdTrack.nWriteSize   = nWriteSize;
 	g_tdTrack.nWriteCount  = g_tdTrack.nWriteSize;
 	g_FDC.nServiceState    = 0;
 	g_FDC.nProcessFunction = psWriteTrack;
-	//g_byTrackWritePerformed = 1;
+	g_byTrackWritePerformed = 1;
 }
 
 //-----------------------------------------------------------------------------
@@ -3209,7 +3283,7 @@ void PurgeRwBuffer(void)
 	{
 		#ifdef MFC
 			strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
-			WriteLogFile(g_szRwBuf);
+			WriteFdcLogFile(g_szRwBuf);
 		#else
 			puts(g_szRwBuf);
 		#endif
@@ -3334,7 +3408,7 @@ void __not_in_flash_func(fdc_write_cmd)(byte byData)
 
 	#ifdef MFC
 		strcat_s(buf, sizeof(buf)-1, "\r\n");
-		WriteLogFile(buf);
+		WriteFdcLogFile(buf);
 	#else
 		puts(buf);
 	#endif
@@ -3354,7 +3428,7 @@ void __not_in_flash_func(fdc_write_track)(byte byData)
 
 	#ifdef MFC
 		strcat_s(buf, sizeof(buf)-1, "\r\n");
-		WriteLogFile(buf);
+		WriteFdcLogFile(buf);
 	#else
 		puts(buf);
 	#endif
@@ -3403,7 +3477,7 @@ void __not_in_flash_func(fdc_write_sector)(byte byData)
 
 	#ifdef MFC
 		strcat_s(buf, sizeof(buf)-1, "\r\n");
-		WriteLogFile(buf);
+		WriteFdcLogFile(buf);
 	#else
 		puts(buf);
 	#endif
@@ -3459,7 +3533,7 @@ void __not_in_flash_func(fdc_write_data)(byte byData)
 
 		#ifdef MFC
 			strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
-			WriteLogFile(g_szRwBuf);
+			WriteFdcLogFile(g_szRwBuf);
 		#else
 			puts(g_szRwBuf);
 		#endif
@@ -3638,7 +3712,7 @@ byte __not_in_flash_func(fdc_read_status)(void)
 
 		#ifdef MFC
 			strcat_s(buf2, sizeof(buf2)-1, "\r\n");
-			WriteLogFile(buf2);
+			WriteFdcLogFile(buf2);
 		#else
 			puts(buf2);
 		#endif
@@ -3666,7 +3740,7 @@ byte __not_in_flash_func(fdc_read_track)(void)
 
 	#ifdef MFC
 		strcat_s(buf, sizeof(buf)-1, "\r\n");
-		WriteLogFile(buf);
+		WriteFdcLogFile(buf);
 	#else
 		puts(buf);
 	#endif
@@ -3685,7 +3759,7 @@ byte __not_in_flash_func(fdc_read_sector)(void)
 
 	#ifdef MFC
 		strcat_s(buf, sizeof(buf)-1, "\r\n");
-		WriteLogFile(buf);
+		WriteFdcLogFile(buf);
 	#else
 		puts(buf);
 	#endif
@@ -3719,7 +3793,7 @@ byte __not_in_flash_func(fdc_read_data)(void)
 
 				#ifdef MFC
 					strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
-					WriteLogFile(g_szRwBuf);
+					WriteFdcLogFile(g_szRwBuf);
 				#else
 					puts(g_szRwBuf);
 				#endif
@@ -3762,7 +3836,7 @@ byte __not_in_flash_func(fdc_read_data)(void)
 
 		#ifdef MFC
 			strcat_s(g_szRwBuf, sizeof(g_szRwBuf)-1, "\r\n");
-			WriteLogFile(g_szRwBuf);
+			WriteFdcLogFile(g_szRwBuf);
 		#else
 			puts(g_szRwBuf);
 		#endif
@@ -3822,7 +3896,7 @@ void __not_in_flash_func(fdc_write_drive_select)(byte byData)
 
 		#ifdef MFC
 			strcat_s(buf, sizeof(buf)-1, "\r\n");
-			WriteLogFile(buf);
+			WriteFdcLogFile(buf);
 		#else
 			puts(buf);
 		#endif

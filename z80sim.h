@@ -57,6 +57,9 @@ public:
 	afx_msg void OnFileEnablelog();
 	virtual CDocument* OpenDocumentFile(LPCTSTR lpszFileName);
 	afx_msg void OnSimulateBreakspoints();
+    afx_msg void OnUpdateFileEnablelog(CCmdUI* pCmdUI);
+    afx_msg void OnFileEnableFdcLog();
+    afx_msg void OnUpdateFileEnablefdclog(CCmdUI* pCmdUI);
 };
 
 extern CZ80SimApp theApp;

@@ -8567,7 +8567,7 @@ void LogInstruction(word pc)
 	}
 
 	strcat_s(szBuf, sizeof(szBuf)-1, "\r\n");
-	WriteLogFile(szBuf);
+	WriteCpuLogFile(szBuf);
 }
 #endif
 
@@ -8720,7 +8720,7 @@ void EmuExecute(void)
 		cpu.cycles = 0;
 
 #ifdef ENABLE_LOGGING
-		if (g_bLogOpen)
+		if (g_bCpuLogOpen)
 		{
 			LogInstruction(pc);
 		}
