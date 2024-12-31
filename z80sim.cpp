@@ -83,6 +83,7 @@ CZ80SimApp::CZ80SimApp() noexcept
 CZ80SimApp::~CZ80SimApp()
 {
 	CloseCpuLogFile();
+	CloseFdcLogFile();
 }
 
 // The one and only CZ80SimApp object

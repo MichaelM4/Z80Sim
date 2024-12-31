@@ -123,7 +123,7 @@ Byte  Description
       Bit-6: if set indicates it is a single density dikette; if not set it is a double density diskette;
       Bit-7: if set then the density of the disk it to be ignored.
 5-11  Reserved for future use
-12-15 0x00, 0x00, 0x00, 0x00 - for virtual diskette navive format
+12-15 0x00, 0x00, 0x00, 0x00 - for virtual diskette native format
       0x12, 0x34, 0x56, 0x78 - if virtual disk is a REAL disk specification file
 
 Track Data:
@@ -239,7 +239,7 @@ DAM marker values:
 /*
 	RS Double Density Adapter
 
-	Function selection is perfomed via writes to the sector register (0x37EE)
+	Function selection is perfomed via writes to the sector register (at address 0x37EE)
 
 	Value		Function
 	--------------------------------
@@ -802,7 +802,7 @@ int FdcGetDAM_Offset(TrackType* ptdTrack, int nIDAM, int nDataSize)
 		return -1;
 	}
 
-	if ((nDataSize == 1) && (ptdTrack->byDensity == eDD)) // double density
+	if ((nDataSize == 1) && (nIDAM & 0x8000)) // double density
 	{
 		// locate the byte sequence 0xA1, 0xA1, 0xA1, 0xFB/0xF8
 		while (nDataOffset < ptdTrack->nTrackSize)
@@ -2064,17 +2064,6 @@ void FdcProcessWriteTrackCommand(void)
 		nWriteSize = 3105;
 	}
 
-	if (nWriteSize != g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength)
-	{
-		g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength = nWriteSize;
-		g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader[3] = g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength >> 8;
-		g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader[2] = g_dtDives[g_tdTrack.nDrive].dmk.wTrackLength & 0xFF;
-
-		FileSeek(g_dtDives[g_tdTrack.nDrive].f, 0);
-		FileWrite(g_dtDives[g_tdTrack.nDrive].f, g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader, sizeof(g_dtDives[g_tdTrack.nDrive].dmk.byDmkDiskHeader));
-		FileFlush(g_dtDives[g_tdTrack.nDrive].f);
-	}
-
 	g_tdTrack.nDrive       = FdcGetDriveIndex(g_FDC.byDriveSel);
 	g_tdTrack.nSide        = nSide;
 	g_tdTrack.nTrack       = g_FDC.byTrack;
@@ -2539,7 +2528,8 @@ void FdcBuildIdamTable(TrackType* ptdTrack)
 	BYTE* pbyTrackData = ptdTrack->byTrackData;
 	BYTE  byDensity    = g_dtDives[ptdTrack->nDrive].dmk.byDensity;
 	BYTE  byFound;
-	int   nIndex, nIDAM;
+	word  wIDAM;
+	int   nDataIndex, nIdamIndex;
 	int   nTrackSize = ptdTrack->nTrackSize;
 
 	// reset IDAM table to 0's
@@ -2547,28 +2537,28 @@ void FdcBuildIdamTable(TrackType* ptdTrack)
 	memset(ptdTrack->nIDAM, 0, sizeof(ptdTrack->nIDAM));
 
 	// search track data for sectors (start at first byte after the last IDAM index)
-	nIndex = 128;
-	nIDAM  = 0;
+	nDataIndex = 128;
+	nIdamIndex = 0;
 
-	while (nIndex < nTrackSize)
+	while (nDataIndex < nTrackSize)
 	{
 		byFound = 0;
 
-		while ((byFound == 0) && (nIndex < nTrackSize))
+		while ((byFound == 0) && (nDataIndex < nTrackSize))
 		{
-			if ((*(pbyTrackData+nIndex) == 0xA1) && (*(pbyTrackData+nIndex+1) == 0xA1) && (*(pbyTrackData+nIndex+2) == 0xA1) && (*(pbyTrackData+nIndex+3) == 0xFE))
+			if ((*(pbyTrackData+nDataIndex) == 0xA1) && (*(pbyTrackData+nDataIndex+1) == 0xA1) && (*(pbyTrackData+nDataIndex+2) == 0xA1) && (*(pbyTrackData+nDataIndex+3) == 0xFE))
 			{
 				byDensity = eDD;
 				byFound = 1;
 			}
-			else if (*(pbyTrackData+nIndex) == 0xFE)
+			else if (*(pbyTrackData+nDataIndex) == 0xFE)
 			{
 				byDensity = eSD;
 				byFound = 1;
 			}
 			else
 			{
-				++nIndex;
+				++nDataIndex;
 			}
 		}
 
@@ -2579,16 +2569,23 @@ void FdcBuildIdamTable(TrackType* ptdTrack)
 			if (byDensity == eDD) // Double Density
 			{
 				// advance to the 0xFE byte. 
-				nIndex += 3; // The IDAM pointer is the offset from the start of track data to the 0xFE of the associated sector.
+				nDataIndex += 3; // The IDAM pointer is the offset from the start of track data to the 0xFE of the associated sector.
 			}
 
-			ptdTrack->nIDAM[nIDAM] = nIndex;
+			wIDAM = nDataIndex;
 
-			*(pbyTrackData + nIDAM * 2)     = nIndex & 0xFF;
-			*(pbyTrackData + nIDAM * 2 + 1) = nIndex >> 8;
+			if (byDensity == eDD) // Double Density
+			{
+				wIDAM |= 0x8000;
+			}
 
-			++nIDAM;
-			nIndex += 2;
+			ptdTrack->nIDAM[nIdamIndex] = wIDAM;
+
+			*(pbyTrackData + nIdamIndex * 2)     = wIDAM & 0xFF;
+			*(pbyTrackData + nIdamIndex * 2 + 1) = wIDAM >> 8;
+
+			++nIdamIndex;
+			nDataIndex += 2;
 		}
 	}
 }
@@ -3342,7 +3339,7 @@ void GetCommandText(char* psz, int nMaxLen, BYTE byCmd)
 	}
 	else if ((byCmd & 0xF0) == 0xA0) // 1010xxxx
 	{
-		sprintf_s(psz, nMaxLen, "CMD: %02X WSEC: %02X TRK: %02X", byCmd, g_FDC.bySector, g_FDC.byTrack);
+		sprintf_s(psz, nMaxLen, "CMD: %02X DRV: %02X TRK: %02X WSEC: %02X", byCmd, g_FDC.byDriveSel, g_FDC.byTrack, g_FDC.bySector);
 	}
 	else if ((byCmd & 0xF0) == 0xB0) // 1011xxxx
 	{
@@ -3639,6 +3636,26 @@ void __not_in_flash_func(fdc_get_status_string)(char* buf, int nMaxLen, BYTE byS
 	else if ((g_FDC.byCommandType == 2) ||	// Read Sector, Write Sector
 			 (g_FDC.byCommandType == 3))	// Read Address, Read Track, Write Track
 	{
+		byte byCmd;
+
+		// S5 (RECORD TYPE) default to 0
+		if (byStatus & F_DELETED)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_DELETED|");
+		}
+
+		// S6 (PROTECTED) default to 0
+		if (byStatus & F_PROTECT)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_PROTECT|");
+		}
+
+		// S7 (NOT READY) default to 0
+		if (byStatus & F_NOTREADY)
+		{
+			strcat_s(buf, nMaxLen, (char*)"F_NOTREADY|");
+		}
+		
 		// S0 (BUSY)
 		if (byStatus & F_BUSY)
 		{
@@ -3669,16 +3686,44 @@ void __not_in_flash_func(fdc_get_status_string)(char* buf, int nMaxLen, BYTE byS
 			strcat_s(buf, nMaxLen, (char*)"F_NOTFOUND|");
 		}
 	
-		// S5 (RECORD TYPE) default to 0
-		if (byStatus & F_DELETED)
-		{
-			strcat_s(buf, nMaxLen, (char*)"F_DELETED|");
-		}
+		byCmd = g_FDC.byCurCommand >> 4;
 
-		// S6 (PROTECTED) default to 0
-		if (byStatus & F_PROTECT)
+		// S5 and S6 based on latest command, not just command type
+		if ((byCmd == 8) || (byCmd == 9)) // read sector (8=single; 9=multiple)
 		{
-			strcat_s(buf, nMaxLen, (char*)"F_PROTECT|");
+			if (byStatus & 0x40)
+			{
+				strcat_s(buf, nMaxLen, (char*)"S6|");
+			}
+
+			if (byStatus & 0x20)
+			{
+				strcat_s(buf, nMaxLen, (char*)"S5|");
+			}
+		}
+		else if (g_FDC.byCurCommand == 0xC4) // read address
+		{
+			// S5 = 0
+			// S6 = 0
+		}
+		else if ((g_FDC.byCurCommand == 0xE4) || (g_FDC.byCurCommand == 0xE6)) // read track
+		{
+			// S5 = 0
+			// S6 = 0
+		}
+		else if ((byCmd == 10) || (byCmd == 11)) // write sector  (8=single; 9=multiple)
+		{
+			if (byStatus & 0x40)
+			{
+				strcat_s(buf, nMaxLen, (char*)"PROTECTED|");
+			}
+		}
+		else if (byCmd == 0xF4) // write track
+		{
+			if (byStatus & 0x40)
+			{
+				strcat_s(buf, nMaxLen, (char*)"PROTECTED|");
+			}
 		}
 
 		// S7 (NOT READY) default to 0
