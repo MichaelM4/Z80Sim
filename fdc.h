@@ -332,7 +332,7 @@ typedef struct {
 
 	BYTE  byDoublerEnable;
 	BYTE  byDoublerSide;
-	BYTE  byDoublerDensity;
+//	BYTE  byDoublerDensity;
 	BYTE  byDoublerPrecomp;
 } FdcType;
 
@@ -361,12 +361,6 @@ typedef struct {
 extern volatile BYTE g_byIntrRequest;
 extern FdcType       g_FDC;
 extern FdcDriveType  g_dtDives[MAX_DRIVES];
-
-extern bool g_bFdcLogOpen;
-
-void OpenFdcLogFile(void);
-void CloseFdcLogFile(void);
-void WriteFdcLogFile(char* psz);
 
 /* function prototypes ==========================================*/
 

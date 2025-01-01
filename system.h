@@ -25,6 +25,7 @@ typedef struct {
 // variables
 
 extern bool g_bCpuLogOpen;
+extern bool g_bFdcLogOpen;
 extern SystemType sysdef;
 
 // function definitions
@@ -33,6 +34,10 @@ extern SystemType sysdef;
 void OpenCpuLogFile(void);
 void CloseCpuLogFile(void);
 void WriteCpuLogFile(char* psz);
+
+void OpenFdcLogFile(void);
+void CloseFdcLogFile(void);
+void WriteFdcLogFile(char* psz);
 
 uint32_t GetCycDuration(uint32_t dwStart, uint32_t dwEnd);
 void  StartStopWatch(void);

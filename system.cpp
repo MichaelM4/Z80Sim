@@ -113,6 +113,65 @@ void WriteCpuLogFile(char* psz)
 	g_nCpuLogHead += nLen;
 }
 
+CFile g_fFdcLog;
+bool  g_bFdcLogOpen = false;
+
+char  g_szFdcLogBuffer[0x40000];
+int   g_nFdcLogHead = 0;
+
+void OpenFdcLogFile(void)
+{
+	if (g_bFdcLogOpen)
+	{
+		return;
+	}
+
+	if (!g_fFdcLog.Open(_T("D:\\Temp\\FDC.txt"), CFile::modeWrite | CFile::modeCreate | CFile::typeBinary))
+	{
+		return;
+	}
+
+	g_nFdcLogHead = 0;
+	g_bFdcLogOpen = true;
+	g_szFdcLogBuffer[0] = 0;
+}
+
+void CloseFdcLogFile(void)
+{
+	if (!g_bFdcLogOpen)
+	{
+		return;
+	}
+
+	if (g_nFdcLogHead > 0)
+	{
+		g_fFdcLog.Write(g_szFdcLogBuffer, g_nFdcLogHead);
+	}
+
+	g_fFdcLog.Close();
+	g_bFdcLogOpen = false;
+}
+
+void WriteFdcLogFile(char* psz)
+{
+	if (!g_bFdcLogOpen)
+	{
+		return;
+	}
+
+	int nLen = (int)strlen(psz);
+
+	if ((nLen + g_nFdcLogHead) >= (sizeof(g_szFdcLogBuffer) - 20))
+	{
+		g_fFdcLog.Write(g_szFdcLogBuffer, g_nFdcLogHead);
+		g_nFdcLogHead = 0;
+		g_szFdcLogBuffer[0] = 0;
+	}
+
+	strcpy_s(g_szFdcLogBuffer+g_nFdcLogHead, sizeof(g_szFdcLogBuffer)-g_nFdcLogHead, psz);
+	g_nFdcLogHead += nLen;
+}
+
 #endif
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
